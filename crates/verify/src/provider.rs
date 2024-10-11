@@ -1,8 +1,10 @@
-use super::{
-    etherscan::EtherscanVerificationProvider, sourcify::SourcifyVerificationProvider, VerifyArgs,
-    VerifyCheckArgs,
+use crate::{
+    etherscan::EtherscanVerificationProvider,
+    sourcify::SourcifyVerificationProvider,
+    verify::{VerifyArgs, VerifyCheckArgs},
+    zk_provider::CompilerVerificationContext,
+    zksync::ZkVerificationProvider,
 };
-use crate::zk_provider::CompilerVerificationContext;
 use alloy_json_abi::JsonAbi;
 use async_trait::async_trait;
 use eyre::{OptionExt, Result};
@@ -38,7 +40,7 @@ impl VerificationContext {
         project.no_artifacts = true;
 
         let solc = Solc::find_or_install(&compiler_version)?;
-        project.compiler.solc = SolcCompiler::Specific(solc);
+        project.compiler.solc = Some(SolcCompiler::Specific(solc));
 
         Ok(Self { config, project, target_name, target_path, compiler_version })
     }
@@ -102,7 +104,7 @@ pub trait VerificationProvider {
     /// [`VerifyArgs`] are valid to begin with. This should prevent situations where there's a
     /// contract deployment that's executed before the verify request and the subsequent verify task
     /// fails due to misconfiguration.
-    async fn preflight_check(
+    async fn preflight_verify_check(
         &mut self,
         args: VerifyArgs,
         context: CompilerVerificationContext,
@@ -128,6 +130,7 @@ impl FromStr for VerificationProviderType {
             "s" | "sourcify" => Ok(Self::Sourcify),
             "b" | "blockscout" => Ok(Self::Blockscout),
             "o" | "oklink" => Ok(Self::Oklink),
+            "z" | "zksync" => Ok(Self::ZKsync),
             _ => Err(format!("Unknown provider: {s}")),
         }
     }
@@ -148,6 +151,9 @@ impl fmt::Display for VerificationProviderType {
             Self::Oklink => {
                 write!(f, "oklink")?;
             }
+            Self::ZKsync => {
+                write!(f, "zksync")?;
+            }
         };
         Ok(())
     }
@@ -160,6 +166,8 @@ pub enum VerificationProviderType {
     Sourcify,
     Blockscout,
     Oklink,
+    #[value(alias = "zksync")]
+    ZKsync,
 }
 
 impl VerificationProviderType {
@@ -175,6 +183,7 @@ impl VerificationProviderType {
             Self::Sourcify => Ok(Box::<SourcifyVerificationProvider>::default()),
             Self::Blockscout => Ok(Box::<EtherscanVerificationProvider>::default()),
             Self::Oklink => Ok(Box::<EtherscanVerificationProvider>::default()),
+            Self::ZKsync => Ok(Box::<ZkVerificationProvider>::default()),
         }
     }
 }

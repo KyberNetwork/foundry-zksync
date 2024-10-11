@@ -6,15 +6,6 @@ use era_test_node::{
     utils::bytecode_to_factory_dep,
 };
 use itertools::Itertools;
-use multivm::{
-    interface::{Halt, VmInterface, VmRevertReason},
-    tracers::CallTracer,
-    vm_latest::{
-        ExecutionResult, HistoryDisabled, ToTracerPointer, Vm, VmExecutionMode,
-        VmExecutionResultAndLogs,
-    },
-};
-use once_cell::sync::OnceCell;
 use revm::{
     db::states::StorageSlot,
     primitives::{
@@ -26,14 +17,26 @@ use revm::{
 };
 use tracing::{debug, error, info, trace, warn};
 use zksync_basic_types::{ethabi, L2ChainId, Nonce, H160, H256, U256};
-use zksync_state::{ReadStorage, StoragePtr, WriteStorage};
+use zksync_multivm::{
+    interface::{
+        Call, CallType, ExecutionResult, Halt, VmEvent, VmExecutionResultAndLogs, VmFactory,
+        VmInterface, VmRevertReason,
+    },
+    tracers::CallTracer,
+    vm_latest::{HistoryDisabled, ToTracerPointer, Vm},
+};
+use zksync_state::interface::{ReadStorage, StoragePtr, WriteStorage};
 use zksync_types::{
-    l2::L2Tx, vm_trace::Call, PackedEthSignature, StorageKey, Transaction, VmEvent,
-    ACCOUNT_CODE_STORAGE_ADDRESS, CONTRACT_DEPLOYER_ADDRESS,
+    l2::L2Tx, PackedEthSignature, StorageKey, Transaction, ACCOUNT_CODE_STORAGE_ADDRESS,
+    CONTRACT_DEPLOYER_ADDRESS,
 };
 use zksync_utils::{be_words_to_bytes, h256_to_account_address, h256_to_u256, u256_to_h256};
 
-use std::{collections::HashMap, fmt::Debug, sync::Arc};
+use std::{
+    collections::HashMap,
+    fmt::Debug,
+    sync::{Arc, LazyLock},
+};
 
 use crate::{
     convert::{ConvertAddress, ConvertH160, ConvertH256, ConvertU256},
@@ -427,9 +430,8 @@ fn inspect_inner<S: ReadStorage>(
 
     let tx: Transaction = l2_tx.clone().into();
 
-    vm.push_transaction(tx.clone());
-    let call_tracer_result = Arc::new(OnceCell::default());
-    let cheatcode_tracer_result = Arc::new(OnceCell::default());
+    let call_tracer_result = Arc::default();
+    let cheatcode_tracer_result = Arc::default();
     let mut expected_calls = HashMap::<_, _>::new();
     if let Some(ec) = &ccx.expected_calls {
         for (addr, v) in ec.iter() {
@@ -438,21 +440,24 @@ fn inspect_inner<S: ReadStorage>(
     }
     let is_static = call_ctx.is_static;
     let is_create = call_ctx.is_create;
-    let bootloader_debug_tracer_result = Arc::new(OnceCell::default());
+    let bootloader_debug_tracer_result = Arc::default();
     let tracers = vec![
         ErrorTracer.into_tracer_pointer(),
-        CallTracer::new(call_tracer_result.clone()).into_tracer_pointer(),
-        BootloaderDebugTracer { result: bootloader_debug_tracer_result.clone() }
+        CallTracer::new(Arc::clone(&call_tracer_result)).into_tracer_pointer(),
+        BootloaderDebugTracer { result: Arc::clone(&bootloader_debug_tracer_result) }
             .into_tracer_pointer(),
         CheatcodeTracer::new(
             ccx.mocked_calls.clone(),
             expected_calls,
-            cheatcode_tracer_result.clone(),
+            Arc::clone(&cheatcode_tracer_result),
             call_ctx,
         )
         .into_tracer_pointer(),
     ];
-    let mut tx_result = vm.inspect(tracers.into(), VmExecutionMode::OneTx);
+    let (compressed_bytecodes, mut tx_result) =
+        vm.inspect_transaction_with_bytecode_compression(&mut tracers.into(), tx, true);
+    let compressed_bytecodes = compressed_bytecodes.expect("failed compressing bytecodes");
+
     let mut call_traces = Arc::try_unwrap(call_tracer_result).unwrap().take().unwrap_or_default();
     trace!(?tx_result.result, "zk vm result");
 
@@ -537,8 +542,7 @@ fn inspect_inner<S: ReadStorage>(
         formatter::print_event(event, resolve_hashes);
     }
 
-    let bytecodes = vm
-        .get_last_tx_compressed_bytecodes()
+    let bytecodes = compressed_bytecodes
         .iter()
         .map(|b| {
             bytecode_to_factory_dep(b.original.clone())
@@ -599,11 +603,11 @@ fn inspect_inner<S: ReadStorage>(
 /// Patch CREATE traces with bytecode as the data is empty bytes.
 fn call_traces_patch_create<S: ReadStorage>(
     deployed_bytecode_hashes: &HashMap<H160, H256>,
-    bytecodes: &rHashMap<U256, Vec<U256>>,
+    bytecodes: &HashMap<U256, Vec<U256>>,
     storage: StoragePtr<StorageView<S>>,
     call: &mut Call,
 ) {
-    if matches!(call.r#type, zksync_types::vm_trace::CallType::Create) {
+    if matches!(call.r#type, CallType::Create) {
         if let Some(hash) = deployed_bytecode_hashes.get(&call.to).cloned() {
             let maybe_bytecode = bytecodes
                 .get(&h256_to_u256(hash))
@@ -695,18 +699,18 @@ where
         .unwrap_or_default()
 }
 
-lazy_static::lazy_static! {
-    /// Maximum size allowed for factory_deps during create.
-    /// We batch factory_deps till this upper limit if there are multiple deps.
-    /// These batches are then deployed individually.
-    ///
-    /// TODO: This feature is disabled by default via `usize::MAX` due to inconsistencies
-    /// with determining a value that works in all cases.
-    static ref MAX_FACTORY_DEPENDENCIES_SIZE_BYTES: usize = std::env::var("MAX_FACTORY_DEPENDENCIES_SIZE_BYTES")
-                                                            .ok()
-                                                            .and_then(|value| value.parse::<usize>().ok())
-                                                            .unwrap_or(usize::MAX);
-}
+/// Maximum size allowed for factory_deps during create.
+/// We batch factory_deps till this upper limit if there are multiple deps.
+/// These batches are then deployed individually.
+///
+/// TODO: This feature is disabled by default via `usize::MAX` due to inconsistencies
+/// with determining a value that works in all cases.
+static MAX_FACTORY_DEPENDENCIES_SIZE_BYTES: LazyLock<usize> = LazyLock::new(|| {
+    std::env::var("MAX_FACTORY_DEPENDENCIES_SIZE_BYTES")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(usize::MAX)
+});
 
 /// Batch factory deps on the basis of size.
 ///
@@ -764,7 +768,7 @@ fn split_tx_by_factory_deps(mut tx: L2Tx) -> Vec<L2Tx> {
     let mut txs = Vec::with_capacity(batched.len() + 1);
     for deps in batched.into_iter() {
         txs.push(L2Tx::new(
-            H160::zero(),
+            Some(H160::zero()),
             Vec::default(),
             tx.common_data.nonce,
             tx.common_data.fee.clone(),

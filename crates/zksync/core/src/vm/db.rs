@@ -10,11 +10,11 @@ use alloy_primitives::{Address, U256 as rU256};
 use foundry_cheatcodes_common::record::RecordAccess;
 use revm::{primitives::Account, Database, EvmContext, InnerEvmContext};
 use zksync_basic_types::{L2ChainId, H160, H256, U256};
-use zksync_state::ReadStorage;
+use zksync_state::interface::ReadStorage;
 use zksync_types::{
     get_code_key, get_nonce_key, get_system_context_init_logs,
     utils::{decompose_full_nonce, storage_key_for_eth_balance},
-    Nonce, StorageKey, StorageLog, StorageLogKind, StorageValue,
+    Nonce, StorageKey, StorageLog, StorageValue,
 };
 
 use zksync_utils::{bytecode::hash_bytecode, h256_to_u256};
@@ -92,8 +92,7 @@ where
             })
             .chain(system_context_init_log)
             .for_each(|log| {
-                (log.kind == StorageLogKind::Write)
-                    .then_some(override_keys.insert(log.key, log.value));
+                (log.is_write()).then_some(override_keys.insert(log.key, log.value));
             });
 
         let mut factory_deps = contracts
@@ -166,22 +165,19 @@ where
 
     /// Load an account into the journaled state.
     pub fn load_account(&mut self, address: Address) -> &mut Account {
-        let (account, _) = self.ecx.load_account(address).expect("account could not be loaded");
-        account
+        self.ecx.load_account(address).expect("account could not be loaded").data
     }
 
     /// Load an storage slot into the journaled state.
     /// The account must be already loaded else this function panics.
     pub fn sload(&mut self, address: Address, key: rU256) -> rU256 {
-        let (value, _) = self.ecx.sload(address, key).unwrap_or_default();
-        value
+        self.ecx.sload(address, key).unwrap_or_default().data
     }
 
     fn read_db(&mut self, address: H160, idx: U256) -> H256 {
         let addr = address.to_address();
         self.ecx.load_account(addr).expect("failed loading account");
-        let (value, _) = self.ecx.sload(addr, idx.to_ru256()).expect("failed sload");
-        value.to_h256()
+        self.ecx.sload(addr, idx.to_ru256()).expect("failed sload").to_h256()
     }
 }
 
