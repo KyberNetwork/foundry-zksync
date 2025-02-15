@@ -16,7 +16,7 @@ FOUNDRY_BIN_PATH="$FOUNDRY_BIN_DIR/foundryup-zksync"
 
 FOUNDRYUP_JOBS=""
 
-BINS=(forge cast)
+BINS=(forge-zksync cast-zksync)
 
 export RUSTFLAGS="${RUSTFLAGS:--C target-cpu=native}"
 
