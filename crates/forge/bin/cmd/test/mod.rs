@@ -12,18 +12,21 @@ use forge::{
         debug::{ContractSources, DebugTraceIdentifier},
         decode_trace_arena, folded_stack_trace,
         identifier::SignaturesIdentifier,
-        render_trace_arena, CallTraceDecoderBuilder, InternalTraceMode, TraceKind,
+        CallTraceDecoderBuilder, InternalTraceMode, TraceKind,
     },
-    MultiContractRunner, MultiContractRunnerBuilder, TestFilter, TestOptions, TestOptionsBuilder,
+    MultiContractRunner, MultiContractRunnerBuilder, TestFilter,
 };
 use foundry_cli::{
-    opts::CoreBuildArgs,
+    opts::{BuildOpts, GlobalArgs},
     utils::{self, LoadConfig},
 };
-use foundry_common::{compile::ProjectCompiler, evm::EvmArgs, fs, shell};
+use foundry_common::{compile::ProjectCompiler, evm::EvmArgs, fs, shell, TestFunctionExt};
 use foundry_compilers::{
     artifacts::output_selection::OutputSelection,
-    compilers::{multi::MultiCompilerLanguage, CompilerSettings, Language},
+    compilers::{
+        multi::{MultiCompiler, MultiCompilerLanguage},
+        Language,
+    },
     utils::source_files_iter,
     ProjectCompileOutput,
 };
@@ -34,11 +37,11 @@ use foundry_config::{
         Metadata, Profile, Provider,
     },
     filter::GlobMatcher,
-    get_available_profiles, Config,
+    Config,
 };
 use foundry_debugger::Debugger;
 use foundry_evm::traces::identifier::TraceIdentifiers;
-use foundry_zksync_compiler::DualCompiledContracts;
+use foundry_zksync_compilers::dual_compiled_contracts::DualCompiledContracts;
 use regex::Regex;
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -51,62 +54,66 @@ use yansi::Paint;
 
 mod filter;
 mod summary;
-
-use quick_junit::{NonSuccessKind, Report, TestCase, TestCaseStatus, TestSuite};
-use summary::TestSummaryReporter;
-
 pub use filter::FilterArgs;
+use forge::{result::TestKind, traces::render_trace_arena_inner};
+use quick_junit::{NonSuccessKind, Report, TestCase, TestCaseStatus, TestSuite};
+use summary::{format_invariant_metrics_table, TestSummaryReport};
 
 // Loads project's figment and merges the build cli arguments into it
-foundry_config::merge_impl_figment_convert!(TestArgs, opts, evm_opts);
+foundry_config::merge_impl_figment_convert!(TestArgs, build, evm);
 
 /// CLI arguments for `forge test`.
 #[derive(Clone, Debug, Parser)]
 #[command(next_help_heading = "Test options")]
 pub struct TestArgs {
+    // Include global options for users of this struct.
+    #[command(flatten)]
+    pub global: GlobalArgs,
+
     /// The contract file you want to test, it's a shortcut for --match-path.
     #[arg(value_hint = ValueHint::FilePath)]
     pub path: Option<GlobMatcher>,
 
-    /// Run a test in the debugger.
-    ///
-    /// The argument passed to this flag is the name of the test function you want to run, and it
-    /// works the same as --match-test.
-    ///
-    /// If more than one test matches your specified criteria, you must add additional filters
-    /// until only one test is found (see --match-contract and --match-path).
+    /// Run a single test in the debugger.
     ///
     /// The matching test will be opened in the debugger regardless of the outcome of the test.
     ///
     /// If the matching test is a fuzz test, then it will open the debugger on the first failure
-    /// case.
-    /// If the fuzz test does not fail, it will open the debugger on the last fuzz case.
-    ///
-    /// For more fine-grained control of which fuzz case is run, see forge run.
-    #[arg(long, value_name = "TEST_FUNCTION")]
-    debug: Option<Regex>,
+    /// case. If the fuzz test does not fail, it will open the debugger on the last fuzz case.
+    #[arg(long, conflicts_with_all = ["flamegraph", "flamechart", "decode_internal", "rerun"])]
+    debug: bool,
 
     /// Generate a flamegraph for a single test. Implies `--decode-internal`.
-    #[arg(long, conflicts_with = "flamechart")]
+    ///
+    /// A flame graph is used to visualize which functions or operations within the smart contract
+    /// are consuming the most gas overall in a sorted manner.
+    #[arg(long)]
     flamegraph: bool,
 
     /// Generate a flamechart for a single test. Implies `--decode-internal`.
+    ///
+    /// A flame chart shows the gas usage over time, illustrating when each function is
+    /// called (execution order) and how much gas it consumes at each point in the timeline.
     #[arg(long, conflicts_with = "flamegraph")]
     flamechart: bool,
 
-    /// Whether to identify internal functions in traces.
+    /// Identify internal functions in traces.
     ///
-    /// If no argument is passed to this flag, it will trace internal functions scope and decode
-    /// stack parameters, but parameters stored in memory (such as bytes or arrays) will not be
-    /// decoded.
+    /// This will trace internal functions and decode stack parameters.
     ///
-    /// To decode memory parameters, you should pass an argument with a test function name,
-    /// similarly to --debug and --match-test.
-    ///
-    /// If more than one test matches your specified criteria, you must add additional filters
-    /// until only one test is found (see --match-contract and --match-path).
-    #[arg(long, value_name = "TEST_FUNCTION")]
-    decode_internal: Option<Option<Regex>>,
+    /// Parameters stored in memory (such as bytes or arrays) are currently decoded only when a
+    /// single function is matched, similarly to `--debug`, for performance reasons.
+    #[arg(long)]
+    decode_internal: bool,
+
+    /// Dumps all debugger steps to file.
+    #[arg(
+        long,
+        requires = "debug",
+        value_hint = ValueHint::FilePath,
+        value_name = "PATH"
+    )]
+    dump: Option<PathBuf>,
 
     /// Print a gas report.
     #[arg(long, env = "FORGE_GAS_REPORT")]
@@ -116,13 +123,9 @@ pub struct TestArgs {
     #[arg(long, env = "FORGE_ALLOW_FAILURE")]
     allow_failure: bool,
 
-    /// Output test results in JSON format.
-    #[arg(long, help_heading = "Display options")]
-    json: bool,
-
     /// Output test results as JUnit XML report.
-    #[arg(long, conflicts_with = "json", help_heading = "Display options")]
-    junit: bool,
+    #[arg(long, conflicts_with_all = ["quiet", "json", "gas_report", "summary", "list", "show_progress"], help_heading = "Display options")]
+    pub junit: bool,
 
     /// Stop running tests after the first failure.
     #[arg(long)]
@@ -133,7 +136,7 @@ pub struct TestArgs {
     etherscan_api_key: Option<String>,
 
     /// List tests instead of running them.
-    #[arg(long, short, help_heading = "Display options")]
+    #[arg(long, short, conflicts_with_all = ["show_progress", "decode_internal", "summary"], help_heading = "Display options")]
     list: bool,
 
     /// Set seed used to generate randomness during your fuzz runs.
@@ -143,35 +146,22 @@ pub struct TestArgs {
     #[arg(long, env = "FOUNDRY_FUZZ_RUNS", value_name = "RUNS")]
     pub fuzz_runs: Option<u64>,
 
+    /// Timeout for each fuzz run in seconds.
+    #[arg(long, env = "FOUNDRY_FUZZ_TIMEOUT", value_name = "TIMEOUT")]
+    pub fuzz_timeout: Option<u64>,
+
     /// File to rerun fuzz failures from.
     #[arg(long)]
     pub fuzz_input_file: Option<String>,
 
-    /// Max concurrent threads to use.
-    /// Default value is the number of available CPUs.
-    #[arg(long, short = 'j', visible_alias = "jobs")]
-    pub threads: Option<usize>,
-
     /// Show test execution progress.
-    #[arg(long)]
+    #[arg(long, conflicts_with_all = ["quiet", "json"], help_heading = "Display options")]
     pub show_progress: bool,
-
-    #[command(flatten)]
-    filter: FilterArgs,
 
     /// Re-run recorded test failures from last run.
     /// If no failure recorded then regular test run is performed.
     #[arg(long)]
     pub rerun: bool,
-
-    #[command(flatten)]
-    evm_opts: EvmArgs,
-
-    #[command(flatten)]
-    opts: CoreBuildArgs,
-
-    #[command(flatten)]
-    pub watch: WatchArgs,
 
     /// Print test summary table.
     #[arg(long, help_heading = "Display options")]
@@ -180,37 +170,43 @@ pub struct TestArgs {
     /// Print detailed test summary table.
     #[arg(long, help_heading = "Display options", requires = "summary")]
     pub detailed: bool,
+
+    #[command(flatten)]
+    filter: FilterArgs,
+
+    #[command(flatten)]
+    evm: EvmArgs,
+
+    #[command(flatten)]
+    pub build: BuildOpts,
+
+    #[command(flatten)]
+    pub watch: WatchArgs,
 }
 
 impl TestArgs {
-    /// Returns the flattened [`CoreBuildArgs`].
-    pub fn build_args(&self) -> &CoreBuildArgs {
-        &self.opts
-    }
-
     pub async fn run(self) -> Result<TestOutcome> {
         trace!(target: "forge::test", "executing test command");
-        shell::set_shell(shell::Shell::from_args(self.opts.silent, self.json || self.junit))?;
         self.execute_tests().await
     }
 
     /// Returns sources which include any tests to be executed.
     /// If no filters are provided, sources are filtered by existence of test/invariant methods in
-    /// them, If filters are provided, sources are additionaly filtered by them.
+    /// them, If filters are provided, sources are additionally filtered by them.
     pub fn get_sources_to_compile(
         &self,
         config: &Config,
         filter: &ProjectPathsAwareFilter,
     ) -> Result<BTreeSet<PathBuf>> {
         let mut project = config.create_project(true, true)?;
-        project.settings.update_output_selection(|selection| {
+        project.update_output_selection(|selection| {
             *selection = OutputSelection::common_output_selection(["abi".to_string()]);
         });
 
         let output = project.compile()?;
 
         if output.has_compiler_errors() {
-            println!("{output}");
+            sh_println!("{output}")?;
             eyre::bail!("Compilation failed");
         }
 
@@ -229,13 +225,13 @@ impl TestArgs {
 
         if test_sources.is_empty() {
             if filter.is_empty() {
-                println!(
+                sh_println!(
                     "No tests found in project! \
                         Forge looks for functions that starts with `test`."
-                );
+                )?;
             } else {
-                println!("No tests match the provided pattern:");
-                print!("{filter}");
+                sh_println!("No tests match the provided pattern:")?;
+                sh_print!("{filter}")?;
 
                 // Try to suggest a test when there's no match
                 if let Some(test_pattern) = &filter.args().test_pattern {
@@ -248,7 +244,7 @@ impl TestArgs {
                         .flat_map(|(_, abi)| abi.functions.into_keys())
                         .collect::<Vec<_>>();
                     if let Some(suggestion) = utils::did_you_mean(test_name, candidates).pop() {
-                        println!("\nDid you mean `{suggestion}`?");
+                        sh_println!("\nDid you mean `{suggestion}`?")?;
                     }
                 }
             }
@@ -273,14 +269,8 @@ impl TestArgs {
     /// Returns the test results for all matching tests.
     pub async fn execute_tests(mut self) -> Result<TestOutcome> {
         // Merge all configs.
-        let (mut config, mut evm_opts) = self.load_config_and_evm_opts_emit_warnings()?;
-
-        // Set number of max threads to execute tests.
-        // If not specified then the number of threads determined by rayon will be used.
-        if let Some(test_threads) = config.threads {
-            trace!(target: "forge::test", "execute tests with {} max threads", test_threads);
-            rayon::ThreadPoolBuilder::new().num_threads(test_threads).build_global()?;
-        }
+        let (mut config, mut evm_opts) = self.load_config_and_evm_opts()?;
+        let mut strategy = utils::get_executor_strategy(&config);
 
         // Explicitly enable isolation for gas reports for more correct gas accounting.
         if self.gas_report {
@@ -291,40 +281,33 @@ impl TestArgs {
             config.invariant.gas_report_samples = 0;
         }
 
-        // Set up the project.
-        let mut project = config.project()?;
-
         // Install missing dependencies.
-        if install::install_missing_dependencies(&mut config, self.build_args().silent) &&
-            config.auto_detect_remappings
-        {
+        if install::install_missing_dependencies(&mut config) && config.auto_detect_remappings {
             // need to re-configure here to also catch additional remappings
-            config = self.load_config();
-            project = config.project()?;
+            config = self.load_config()?;
         }
 
-        let mut filter = self.filter(&config);
+        // Set up the project.
+        let project = config.project()?;
+
+        let filter = self.filter(&config);
         trace!(target: "forge::test", ?filter, "using filter");
 
         let sources_to_compile = self.get_sources_to_compile(&config, &filter)?;
 
-        let compiler = ProjectCompiler::new()
-            .quiet_if(self.json || self.junit || self.opts.silent)
-            .files(sources_to_compile);
+        let compiler =
+            ProjectCompiler::new().quiet(shell::is_json() || self.junit).files(sources_to_compile);
 
         let output = compiler.compile(&project)?;
 
         let (zk_output, dual_compiled_contracts) = if config.zksync.should_compile() {
             let zk_project =
-                foundry_zksync_compiler::config_create_project(&config, config.cache, false)?;
+                foundry_config::zksync::config_create_project(&config, config.cache, false)?;
 
             let sources_to_compile = self.get_sources_to_compile(&config, &filter)?;
-            let zk_compiler = ProjectCompiler::new()
-                .quiet_if(self.json || self.opts.silent)
-                .files(sources_to_compile);
+            let zk_compiler = ProjectCompiler::new().files(sources_to_compile);
 
-            let zk_output =
-                zk_compiler.zksync_compile(&zk_project, config.zksync.avoid_contracts())?;
+            let zk_output = zk_compiler.zksync_compile(&zk_project)?;
             let dual_compiled_contracts =
                 DualCompiledContracts::new(&output, &zk_output, &project.paths, &zk_project.paths);
 
@@ -335,16 +318,8 @@ impl TestArgs {
 
         // Create test options from general project settings and compiler output.
         let project_root = &project.paths.root;
-        let toml = config.get_config_path();
-        let profiles = get_available_profiles(toml)?;
 
-        let test_options: TestOptions = TestOptionsBuilder::default()
-            .fuzz(config.fuzz.clone())
-            .invariant(config.invariant.clone())
-            .profiles(profiles)
-            .build(&output, project_root)?;
-
-        let should_debug = self.debug.is_some();
+        let should_debug = self.debug;
         let should_draw = self.flamegraph || self.flamechart;
 
         // Determine print verbosity and executor verbosity.
@@ -356,25 +331,26 @@ impl TestArgs {
         let env = evm_opts.evm_env().await?;
 
         // Enable internal tracing for more informative flamegraph.
-        if should_draw {
-            self.decode_internal = Some(None);
+        if should_draw && !self.decode_internal {
+            self.decode_internal = true;
         }
 
         // Choose the internal function tracing mode, if --decode-internal is provided.
-        let decode_internal = if let Some(maybe_fn) = self.decode_internal.as_ref() {
-            if maybe_fn.is_some() {
-                // If function filter is provided, we enable full tracing.
-                InternalTraceMode::Full
-            } else {
-                // If no function filter is provided, we enable simple tracing.
-                InternalTraceMode::Simple
-            }
+        let decode_internal = if self.decode_internal {
+            // If more than one function matched, we enable simple tracing.
+            // If only one function matched, we enable full tracing. This is done in `run_tests`.
+            InternalTraceMode::Simple
         } else {
             InternalTraceMode::None
         };
 
         // Prepare the test builder.
         let config = Arc::new(config);
+
+        strategy.runner.zksync_set_dual_compiled_contracts(
+            strategy.context.as_mut(),
+            dual_compiled_contracts.unwrap_or_default(),
+        );
 
         let runner = MultiContractRunnerBuilder::new(config.clone())
             .set_debug(should_debug)
@@ -383,38 +359,8 @@ impl TestArgs {
             .evm_spec(config.evm_spec_id())
             .sender(evm_opts.sender)
             .with_fork(evm_opts.get_fork(&config, env.clone()))
-            .with_test_options(test_options.clone())
             .enable_isolation(evm_opts.isolate)
-            .alphanet(evm_opts.alphanet)
-            .build(
-                project_root,
-                output.clone(),
-                zk_output,
-                env,
-                evm_opts,
-                dual_compiled_contracts.unwrap_or_default(),
-            )?;
-
-        let mut maybe_override_mt = |flag, maybe_regex: Option<&Regex>| {
-            if let Some(regex) = maybe_regex {
-                let test_pattern = &mut filter.args_mut().test_pattern;
-                if test_pattern.is_some() {
-                    eyre::bail!(
-                        "Cannot specify both --{flag} and --match-test. \
-                        Use --match-contract and --match-path to further limit the search instead."
-                    );
-                }
-                *test_pattern = Some(regex.clone());
-            }
-
-            Ok(())
-        };
-
-        maybe_override_mt("debug", self.debug.as_ref())?;
-        maybe_override_mt(
-            "decode-internal",
-            self.decode_internal.as_ref().and_then(|v| v.as_ref()),
-        )?;
+            .build::<MultiCompiler>(project_root, &output, zk_output, env, evm_opts, strategy)?;
 
         let libraries = runner.libraries.clone();
         let mut outcome = self.run_tests(runner, config, verbosity, &filter, &output).await?;
@@ -423,18 +369,10 @@ impl TestArgs {
             let (suite_name, test_name, mut test_result) =
                 outcome.remove_first().ok_or_eyre("no tests were executed")?;
 
-            let arena = test_result
+            let (_, arena) = test_result
                 .traces
                 .iter_mut()
-                .find_map(
-                    |(kind, arena)| {
-                        if *kind == TraceKind::Execution {
-                            Some(arena)
-                        } else {
-                            None
-                        }
-                    },
-                )
+                .find(|(kind, _)| *kind == TraceKind::Execution)
                 .unwrap();
 
             // Decode traces.
@@ -443,10 +381,11 @@ impl TestArgs {
             let mut fst = folded_stack_trace::build(arena);
 
             let label = if self.flamegraph { "flamegraph" } else { "flamechart" };
-            let contract = suite_name.split(':').last().unwrap();
+            let contract = suite_name.split(':').next_back().unwrap();
             let test_name = test_name.trim_end_matches("()");
             let file_name = format!("cache/{label}_{contract}_{test_name}.svg");
             let file = std::fs::File::create(&file_name).wrap_err("failed to create file")?;
+            let file = std::io::BufWriter::new(file);
 
             let mut options = inferno::flamegraph::Options::default();
             options.title = format!("{label} {contract}::{test_name}");
@@ -457,13 +396,13 @@ impl TestArgs {
             }
 
             // Generate SVG.
-            inferno::flamegraph::from_lines(&mut options, fst.iter().map(|s| s.as_str()), file)
+            inferno::flamegraph::from_lines(&mut options, fst.iter().map(String::as_str), file)
                 .wrap_err("failed to write svg")?;
-            println!("\nSaved to {file_name}");
+            sh_println!("Saved to {file_name}")?;
 
             // Open SVG in default program.
-            if opener::open(&file_name).is_err() {
-                println!("\nFailed to open {file_name}. Please open it manually.");
+            if let Err(e) = opener::open(&file_name) {
+                sh_err!("Failed to open {file_name}; please open it manually: {e}")?;
             }
         }
 
@@ -487,7 +426,11 @@ impl TestArgs {
             }
 
             let mut debugger = builder.build();
-            debugger.try_run()?;
+            if let Some(dump_path) = self.dump {
+                debugger.dump_to_file(&dump_path)?;
+            } else {
+                debugger.try_run_tui()?;
+            }
         }
 
         Ok(outcome)
@@ -503,35 +446,60 @@ impl TestArgs {
         output: &ProjectCompileOutput,
     ) -> eyre::Result<TestOutcome> {
         if self.list {
-            return list(runner, filter, self.json);
+            return list(runner, filter);
         }
 
         trace!(target: "forge::test", "running all tests");
 
+        // If we need to render to a serialized format, we should not print anything else to stdout.
+        let silent = self.gas_report && shell::is_json() || self.summary && shell::is_json();
+
         let num_filtered = runner.matching_test_functions(filter).count();
-        if (self.debug.is_some() ||
-            self.decode_internal.as_ref().map_or(false, |v| v.is_some()) ||
-            self.flamegraph ||
-            self.flamechart) &&
-            num_filtered != 1
-        {
+        if num_filtered != 1 && (self.debug || self.flamegraph || self.flamechart) {
+            let action = if self.flamegraph {
+                "generate a flamegraph"
+            } else if self.flamechart {
+                "generate a flamechart"
+            } else {
+                "run the debugger"
+            };
+            let filter = if filter.is_empty() {
+                String::new()
+            } else {
+                format!("\n\nFilter used:\n{filter}")
+            };
             eyre::bail!(
                 "{num_filtered} tests matched your criteria, but exactly 1 test must match in order to {action}.\n\n\
-                 Use --match-contract and --match-path to further limit the search.\n\
-                 Filter used:\n{filter}",
-                action = if self.flamegraph {"generate a flamegraph"} else if self.flamechart {"generate a flamechart"} else {"run the debugger"},
+                 Use --match-contract and --match-path to further limit the search.{filter}",
             );
         }
 
-        if self.json {
-            let results = runner.test_collect(filter);
-            println!("{}", serde_json::to_string(&results)?);
+        // If exactly one test matched, we enable full tracing.
+        if num_filtered == 1 && self.decode_internal {
+            runner.decode_internal = InternalTraceMode::Full;
+        }
+
+        // Run tests in a non-streaming fashion and collect results for serialization.
+        if !self.gas_report && !self.summary && shell::is_json() {
+            let mut results = runner.test_collect(filter);
+            results.values_mut().for_each(|suite_result| {
+                for test_result in suite_result.test_results.values_mut() {
+                    if verbosity >= 2 {
+                        // Decode logs at level 2 and above.
+                        test_result.decoded_logs = decode_console_logs(&test_result.logs);
+                    } else {
+                        // Empty logs for non verbose runs.
+                        test_result.logs = vec![];
+                    }
+                }
+            });
+            sh_println!("{}", serde_json::to_string(&results)?)?;
             return Ok(TestOutcome::new(results, self.allow_failure));
         }
 
         if self.junit {
             let results = runner.test_collect(filter);
-            println!("{}", junit_xml_report(&results, verbosity).to_string()?);
+            sh_println!("{}", junit_xml_report(&results, verbosity).to_string()?)?;
             return Ok(TestOutcome::new(results, self.allow_failure));
         }
 
@@ -540,7 +508,7 @@ impl TestArgs {
 
         let libraries = runner.libraries.clone();
 
-        // Run tests.
+        // Run tests in a streaming fashion.
         let (tx, rx) = channel::<(String, SuiteResult)>();
         let timer = Instant::now();
         let show_progress = config.show_progress;
@@ -570,16 +538,22 @@ impl TestArgs {
             )?);
         }
 
-        if self.decode_internal.is_some() {
+        if self.decode_internal {
             let sources =
-                ContractSources::from_project_output(output, &config.root.0, Some(&libraries))?;
+                ContractSources::from_project_output(output, &config.root, Some(&libraries))?;
             builder = builder.with_debug_identifier(DebugTraceIdentifier::new(sources));
         }
         let mut decoder = builder.build();
 
-        let mut gas_report = self
-            .gas_report
-            .then(|| GasReport::new(config.gas_reports.clone(), config.gas_reports_ignore.clone()));
+        let mut gas_report = self.gas_report.then(|| {
+            GasReport::new(
+                config.gas_reports.clone(),
+                config.gas_reports_ignore.clone(),
+                config.gas_reports_include_tests,
+            )
+        });
+
+        let mut gas_snapshots = BTreeMap::<String, BTreeMap<String, String>>::new();
 
         let mut outcome = TestOutcome::empty(self.allow_failure);
 
@@ -593,35 +567,46 @@ impl TestArgs {
             // We identify addresses if we're going to print *any* trace or gas report.
             let identify_addresses = verbosity >= 3 ||
                 self.gas_report ||
-                self.debug.is_some() ||
+                self.debug ||
                 self.flamegraph ||
                 self.flamechart;
 
             // Print suite header.
-            println!();
-            for warning in suite_result.warnings.iter() {
-                eprintln!("{} {warning}", "Warning:".yellow().bold());
-            }
-            if !tests.is_empty() {
-                let len = tests.len();
-                let tests = if len > 1 { "tests" } else { "test" };
-                println!("Ran {len} {tests} for {contract_name}");
+            if !silent {
+                sh_println!()?;
+                for warning in suite_result.warnings.iter() {
+                    sh_warn!("{warning}")?;
+                }
+                if !tests.is_empty() {
+                    let len = tests.len();
+                    let tests = if len > 1 { "tests" } else { "test" };
+                    sh_println!("Ran {len} {tests} for {contract_name}")?;
+                }
             }
 
             // Process individual test results, printing logs and traces when necessary.
             for (name, result) in tests {
-                shell::println(result.short_result(name))?;
+                if !silent {
+                    sh_println!("{}", result.short_result(name))?;
 
-                // We only display logs at level 2 and above
-                if verbosity >= 2 {
-                    // We only decode logs from Hardhat and DS-style console events
-                    let console_logs = decode_console_logs(&result.logs);
-                    if !console_logs.is_empty() {
-                        println!("Logs:");
-                        for log in console_logs {
-                            println!("  {log}");
+                    // Display invariant metrics if invariant kind.
+                    if let TestKind::Invariant { metrics, .. } = &result.kind {
+                        if !metrics.is_empty() {
+                            let _ = sh_println!("\n{}\n", format_invariant_metrics_table(metrics));
                         }
-                        println!();
+                    }
+
+                    // We only display logs at level 2 and above
+                    if verbosity >= 2 {
+                        // We only decode logs from Hardhat and DS-style console events
+                        let console_logs = decode_console_logs(&result.logs);
+                        if !console_logs.is_empty() {
+                            sh_println!("Logs:")?;
+                            for log in console_logs {
+                                sh_println!("  {log}")?;
+                            }
+                            sh_println!()?;
+                        }
                     }
                 }
 
@@ -646,7 +631,7 @@ impl TestArgs {
                     // - 0..3: nothing
                     // - 3: only display traces for failed tests
                     // - 4: also display the setup trace for failed tests
-                    // - 5..: display all traces for all tests
+                    // - 5..: display all traces for all tests, including storage changes
                     let should_include = match kind {
                         TraceKind::Execution => {
                             (verbosity == 3 && result.status.is_failure()) || verbosity >= 4
@@ -659,14 +644,14 @@ impl TestArgs {
 
                     if should_include {
                         decode_trace_arena(arena, &decoder).await?;
-                        decoded_traces.push(render_trace_arena(arena));
+                        decoded_traces.push(render_trace_arena_inner(arena, false, verbosity > 4));
                     }
                 }
 
-                if !decoded_traces.is_empty() {
-                    shell::println("Traces:")?;
+                if !silent && !decoded_traces.is_empty() {
+                    sh_println!("Traces:")?;
                     for trace in &decoded_traces {
-                        shell::println(trace)?;
+                        sh_println!("{trace}")?;
                     }
                 }
 
@@ -690,10 +675,89 @@ impl TestArgs {
                         }
                     }
                 }
+
+                // Collect and merge gas snapshots.
+                for (group, new_snapshots) in result.gas_snapshots.iter() {
+                    gas_snapshots.entry(group.clone()).or_default().extend(new_snapshots.clone());
+                }
+            }
+
+            // Write gas snapshots to disk if any were collected.
+            if !gas_snapshots.is_empty() {
+                // Check for differences in gas snapshots if `FORGE_SNAPSHOT_CHECK` is set.
+                // Exiting early with code 1 if differences are found.
+                if std::env::var("FORGE_SNAPSHOT_CHECK").is_ok() {
+                    let differences_found = gas_snapshots.clone().into_iter().fold(
+                        false,
+                        |mut found, (group, snapshots)| {
+                            // If the snapshot file doesn't exist, we can't compare so we skip.
+                            if !&config.snapshots.join(format!("{group}.json")).exists() {
+                                return false;
+                            }
+
+                            let previous_snapshots: BTreeMap<String, String> =
+                                fs::read_json_file(&config.snapshots.join(format!("{group}.json")))
+                                    .expect("Failed to read snapshots from disk");
+
+                            let diff: BTreeMap<_, _> = snapshots
+                                .iter()
+                                .filter_map(|(k, v)| {
+                                    previous_snapshots.get(k).and_then(|previous_snapshot| {
+                                        if previous_snapshot != v {
+                                            Some((
+                                                k.clone(),
+                                                (previous_snapshot.clone(), v.clone()),
+                                            ))
+                                        } else {
+                                            None
+                                        }
+                                    })
+                                })
+                                .collect();
+
+                            if !diff.is_empty() {
+                                let _ = sh_eprintln!(
+                                    "{}",
+                                    format!("\n[{group}] Failed to match snapshots:").red().bold()
+                                );
+
+                                for (key, (previous_snapshot, snapshot)) in &diff {
+                                    let _ = sh_eprintln!(
+                                        "{}",
+                                        format!("- [{key}] {previous_snapshot} → {snapshot}").red()
+                                    );
+                                }
+
+                                found = true;
+                            }
+
+                            found
+                        },
+                    );
+
+                    if differences_found {
+                        sh_eprintln!()?;
+                        eyre::bail!("Snapshots differ from previous run");
+                    }
+                }
+
+                // Create `snapshots` directory if it doesn't exist.
+                fs::create_dir_all(&config.snapshots)?;
+
+                // Write gas snapshots to disk per group.
+                gas_snapshots.clone().into_iter().for_each(|(group, snapshots)| {
+                    fs::write_pretty_json_file(
+                        &config.snapshots.join(format!("{group}.json")),
+                        &snapshots,
+                    )
+                    .expect("Failed to write gas snapshots to disk");
+                });
             }
 
             // Print suite summary.
-            shell::println(suite_result.summary())?;
+            if !silent {
+                sh_println!("{}", suite_result.summary())?;
+            }
 
             // Add the suite result to the outcome.
             outcome.results.insert(contract_name, suite_result);
@@ -710,18 +774,17 @@ impl TestArgs {
 
         if let Some(gas_report) = gas_report {
             let finalized = gas_report.finalize();
-            shell::println(&finalized)?;
+            sh_println!("{}", &finalized)?;
             outcome.gas_report = Some(finalized);
         }
 
-        if !outcome.results.is_empty() {
-            shell::println(outcome.summary(duration))?;
+        if !self.summary && !shell::is_json() {
+            sh_println!("{}", outcome.summary(duration))?;
+        }
 
-            if self.summary {
-                let mut summary_table = TestSummaryReporter::new(self.detailed);
-                shell::println("\n\nTest Summary:")?;
-                summary_table.print_summary(&outcome);
-            }
+        if self.summary && !outcome.results.is_empty() {
+            let summary_report = TestSummaryReport::new(self.detailed, outcome.clone());
+            sh_println!("{}", &summary_report)?;
         }
 
         // Reattach the task.
@@ -764,8 +827,8 @@ impl TestArgs {
     /// bootstrap a new [`watchexe::Watchexec`] loop.
     pub(crate) fn watchexec_config(&self) -> Result<watchexec::Config> {
         self.watch.watchexec_config(|| {
-            let config = Config::from(self);
-            [config.src, config.test]
+            let config = self.load_config()?;
+            Ok([config.src, config.test])
         })
     }
 }
@@ -785,6 +848,9 @@ impl Provider for TestArgs {
         if let Some(fuzz_runs) = self.fuzz_runs {
             fuzz_dict.insert("runs".to_string(), fuzz_runs.into());
         }
+        if let Some(fuzz_timeout) = self.fuzz_timeout {
+            fuzz_dict.insert("timeout".to_string(), fuzz_timeout.into());
+        }
         if let Some(fuzz_input_file) = self.fuzz_input_file.clone() {
             fuzz_dict.insert("failure_persist_file".to_string(), fuzz_input_file.into());
         }
@@ -800,30 +866,22 @@ impl Provider for TestArgs {
             dict.insert("show_progress".to_string(), true.into());
         }
 
-        if let Some(threads) = self.threads {
-            dict.insert("threads".to_string(), threads.into());
-        }
-
         Ok(Map::from([(Config::selected_profile(), dict)]))
     }
 }
 
 /// Lists all matching tests
-fn list(
-    runner: MultiContractRunner,
-    filter: &ProjectPathsAwareFilter,
-    json: bool,
-) -> Result<TestOutcome> {
+fn list(runner: MultiContractRunner, filter: &ProjectPathsAwareFilter) -> Result<TestOutcome> {
     let results = runner.list(filter);
 
-    if json {
-        println!("{}", serde_json::to_string(&results)?);
+    if shell::is_json() {
+        sh_println!("{}", serde_json::to_string(&results)?)?;
     } else {
         for (file, contracts) in results.iter() {
-            println!("{file}");
+            sh_println!("{file}")?;
             for (contract, tests) in contracts.iter() {
-                println!("  {contract}");
-                println!("    {}\n", tests.join("\n    "));
+                sh_println!("  {contract}")?;
+                sh_println!("    {}\n", tests.join("\n    "))?;
             }
         }
     }
@@ -844,10 +902,12 @@ fn persist_run_failures(config: &Config, outcome: &TestOutcome) {
         let mut filter = String::new();
         let mut failures = outcome.failures().peekable();
         while let Some((test_name, _)) = failures.next() {
-            if let Some(test_match) = test_name.split('(').next() {
-                filter.push_str(test_match);
-                if failures.peek().is_some() {
-                    filter.push('|');
+            if test_name.is_any_test() {
+                if let Some(test_match) = test_name.split("(").next() {
+                    filter.push_str(test_match);
+                    if failures.peek().is_some() {
+                        filter.push('|');
+                    }
                 }
             }
         }
@@ -928,7 +988,7 @@ mod tests {
     fn extract_chain() {
         let test = |arg: &str, expected: Chain| {
             let args = TestArgs::parse_from(["foundry-cli", arg]);
-            assert_eq!(args.evm_opts.env.chain, Some(expected));
+            assert_eq!(args.evm.env.chain, Some(expected));
             let (config, evm_opts) = args.load_config_and_evm_opts().unwrap();
             assert_eq!(config.chain, Some(expected));
             assert_eq!(evm_opts.env.chain_id, Some(expected.id()));
@@ -986,17 +1046,15 @@ contract FooBarTest is DSTest {
             "--gas-report",
             "--root",
             &prj.root().to_string_lossy(),
-            "--silent",
         ]);
-
         let outcome = args.run().await.unwrap();
-        let gas_report = outcome.gas_report.unwrap();
+        let gas_report = outcome.gas_report.as_ref().unwrap();
 
-        assert_eq!(gas_report.contracts.len(), 3);
+        assert_eq!(gas_report.contracts.len(), 3, "{}", outcome.summary(Default::default()));
         let call_cnts = gas_report
             .contracts
             .values()
-            .flat_map(|c| c.functions.values().flat_map(|f| f.values().map(|v| v.calls.len())))
+            .flat_map(|c| c.functions.values().flat_map(|f| f.values().map(|v| v.frames.len())))
             .collect::<Vec<_>>();
         // assert that all functions were called at least 100 times
         assert!(call_cnts.iter().all(|c| *c > 100));

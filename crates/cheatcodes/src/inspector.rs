@@ -2,23 +2,26 @@
 
 use crate::{
     evm::{
-        journaled_account,
         mapping::{self, MappingSlots},
         prank::Prank,
-        DealRecord,
+        DealRecord, GasRecord,
     },
-    inspector::utils::CommonCreateInput,
-    script::{Broadcast, ScriptWallets},
+    script::{Broadcast, Wallets},
+    strategy::CheatcodeInspectorStrategy,
     test::{
         assume::AssumeNoRevert,
-        expect::{self, ExpectedEmit, ExpectedRevert, ExpectedRevertKind},
+        expect::{self, ExpectedEmitTracker, ExpectedRevert, ExpectedRevertKind},
+        revert_handlers,
     },
     utils::IgnoredTraces,
-    CheatsConfig, CheatsCtxt, DynCheatcode, Error, Result, Vm,
-    Vm::AccountAccess,
+    CheatsConfig, CheatsCtxt, DynCheatcode, Error, Result,
+    Vm::{self, AccountAccess},
 };
-use alloy_primitives::{hex, keccak256, Address, Bytes, Log, TxKind, B256, U256};
-use alloy_rpc_types::request::{TransactionInput, TransactionRequest};
+use alloy_primitives::{
+    hex,
+    map::{AddressHashMap, HashMap},
+    Address, Bytes, Log, TxKind, B256, U256,
+};
 use alloy_sol_types::{SolCall, SolInterface, SolValue};
 use foundry_cheatcodes_common::{
     expect::{ExpectedCallData, ExpectedCallTracker, ExpectedCallType},
@@ -26,59 +29,48 @@ use foundry_cheatcodes_common::{
     record::RecordAccess,
 };
 use foundry_common::{evm::Breakpoints, TransactionMaybeSigned, SELECTOR_LEN};
-use foundry_config::Config;
 use foundry_evm_core::{
-    abi::{Vm::stopExpectSafeMemoryCall, HARDHAT_CONSOLE_ADDRESS},
-    backend::{DatabaseError, DatabaseExt, LocalForkId, RevertDiagnostic},
-    constants::{
-        CHEATCODE_ADDRESS, CHEATCODE_CONTRACT_HASH, DEFAULT_CREATE2_DEPLOYER,
-        DEFAULT_CREATE2_DEPLOYER_CODE, MAGIC_ASSUME,
-    },
-    decode::decode_console_log,
+    abi::Vm::stopExpectSafeMemoryCall,
+    backend::{DatabaseError, DatabaseExt, RevertDiagnostic},
+    constants::{CHEATCODE_ADDRESS, HARDHAT_CONSOLE_ADDRESS, MAGIC_ASSUME},
     utils::new_evm_with_existing_context,
     InspectorExt,
 };
-use foundry_zksync_compiler::{DualCompiledContract, DualCompiledContracts};
-use foundry_zksync_core::{
-    convert::{ConvertAddress, ConvertH160, ConvertH256, ConvertRU256, ConvertU256},
-    get_account_code_key, get_balance_key, get_nonce_key, Call, ZkPaymasterData,
-    ZkTransactionMetadata, DEFAULT_CREATE2_DEPLOYER_ZKSYNC,
-};
+use foundry_evm_traces::TracingInspectorConfig;
+use foundry_wallets::multi_wallet::MultiWallet;
+use foundry_zksync_core::Call;
 use foundry_zksync_inspectors::TraceCollector;
 use itertools::Itertools;
-use rand::{rngs::StdRng, Rng, SeedableRng};
+use proptest::test_runner::{RngAlgorithm, TestRng, TestRunner};
+use rand::Rng;
 use revm::{
     interpreter::{
-        opcode as op, CallInputs, CallOutcome, CallScheme, CreateInputs, CreateOutcome,
+        opcode as op, CallInputs, CallOutcome, CallScheme, CallValue, CreateInputs, CreateOutcome,
         EOFCreateInputs, EOFCreateKind, Gas, InstructionResult, Interpreter, InterpreterAction,
         InterpreterResult,
     },
     primitives::{
-        AccountInfo, BlockEnv, Bytecode, CreateScheme, EVMError, Env, EvmStorageSlot,
-        ExecutionResult, HashMap as rHashMap, Output, SpecId, EOF_MAGIC_BYTES, KECCAK_EMPTY,
+        BlockEnv, CreateScheme, EVMError, EvmStorageSlot, SignedAuthorization, SpecId,
+        EOF_MAGIC_BYTES,
     },
     EvmContext, InnerEvmContext, Inspector,
 };
-use rustc_hash::FxHashMap;
 use serde_json::Value;
 use std::{
-    collections::{BTreeMap, HashMap, HashSet, VecDeque},
+    cmp::max,
+    collections::{BTreeMap, VecDeque},
     fs::File,
     io::BufReader,
     ops::Range,
     path::PathBuf,
     sync::Arc,
 };
-use zksync_types::{
-    block::{pack_block_info, unpack_block_info},
-    utils::{decompose_full_nonce, nonces_to_full_nonce},
-    ACCOUNT_CODE_STORAGE_ADDRESS, CONTRACT_DEPLOYER_ADDRESS, CURRENT_VIRTUAL_BLOCK_INFO_POSITION,
-    H256, KNOWN_CODES_STORAGE_ADDRESS, L2_BASE_TOKEN_ADDRESS, NONCE_HOLDER_ADDRESS,
-    SYSTEM_CONTEXT_ADDRESS,
-};
-use zksync_web3_rs::eip712::PaymasterParams;
 
 mod utils;
+pub use utils::CommonCreateInput;
+
+pub type Ecx<'a, 'b, 'c> = &'a mut EvmContext<&'b mut (dyn DatabaseExt + 'c)>;
+pub type InnerEcx<'a, 'b, 'c> = &'a mut InnerEvmContext<&'b mut (dyn DatabaseExt + 'c)>;
 
 /// Helper trait for obtaining complete [revm::Inspector] instance from mutable reference to
 /// [Cheatcodes].
@@ -88,71 +80,30 @@ mod utils;
 pub trait CheatcodesExecutor {
     /// Core trait method accepting mutable reference to [Cheatcodes] and returning
     /// [revm::Inspector].
-    fn get_inspector<'a, DB: DatabaseExt>(
-        &'a mut self,
-        cheats: &'a mut Cheatcodes,
-    ) -> impl InspectorExt<DB> + 'a;
-
-    /// Constructs [revm::Evm] and runs a given closure with it.
-    fn with_evm<DB: DatabaseExt, F, O>(
-        &mut self,
-        ccx: &mut CheatsCtxt<DB>,
-        f: F,
-    ) -> Result<O, EVMError<DB::Error>>
-    where
-        F: for<'a, 'b> FnOnce(
-            &mut revm::Evm<
-                '_,
-                &'b mut dyn InspectorExt<&'a mut dyn DatabaseExt>,
-                &'a mut dyn DatabaseExt,
-            >,
-        ) -> Result<O, EVMError<DB::Error>>,
-    {
-        let mut inspector = self.get_inspector(ccx.state);
-        let error = std::mem::replace(&mut ccx.ecx.error, Ok(()));
-        let l1_block_info = std::mem::take(&mut ccx.ecx.l1_block_info);
-
-        let inner = revm::InnerEvmContext {
-            env: ccx.ecx.env.clone(),
-            journaled_state: std::mem::replace(
-                &mut ccx.ecx.journaled_state,
-                revm::JournaledState::new(Default::default(), Default::default()),
-            ),
-            db: &mut ccx.ecx.db as &mut dyn DatabaseExt,
-            error,
-            l1_block_info,
-        };
-
-        let mut evm = new_evm_with_existing_context(inner, &mut inspector as _);
-
-        let res = f(&mut evm)?;
-
-        ccx.ecx.journaled_state = evm.context.evm.inner.journaled_state;
-        ccx.ecx.env = evm.context.evm.inner.env;
-        ccx.ecx.l1_block_info = evm.context.evm.inner.l1_block_info;
-        ccx.ecx.error = evm.context.evm.inner.error;
-
-        Ok(res)
-    }
+    fn get_inspector<'a>(&'a mut self, cheats: &'a mut Cheatcodes) -> Box<dyn InspectorExt + 'a>;
 
     /// Obtains [revm::Evm] instance and executes the given CREATE frame.
-    fn exec_create<DB: DatabaseExt>(
+    fn exec_create(
         &mut self,
         inputs: CreateInputs,
-        ccx: &mut CheatsCtxt<DB>,
-    ) -> Result<CreateOutcome, EVMError<DB::Error>> {
-        self.with_evm(ccx, |evm| {
+        ccx: &mut CheatsCtxt,
+    ) -> Result<CreateOutcome, EVMError<DatabaseError>> {
+        with_evm(self, ccx, |evm| {
             evm.context.evm.inner.journaled_state.depth += 1;
 
             // Handle EOF bytecode
-            let first_frame_or_result = if evm.handler.cfg.spec_id.is_enabled_in(SpecId::PRAGUE_EOF)
-                && inputs.scheme == CreateScheme::Create && inputs.init_code.starts_with(&EOF_MAGIC_BYTES)
+            let first_frame_or_result = if evm.handler.cfg.spec_id.is_enabled_in(SpecId::OSAKA) &&
+                inputs.scheme == CreateScheme::Create &&
+                inputs.init_code.starts_with(&EOF_MAGIC_BYTES)
             {
                 evm.handler.execution().eofcreate(
                     &mut evm.context,
-                    Box::new(EOFCreateInputs::new(inputs.caller, inputs.value, inputs.gas_limit, EOFCreateKind::Tx {
-                        initdata: inputs.init_code,
-                    })),
+                    Box::new(EOFCreateInputs::new(
+                        inputs.caller,
+                        inputs.value,
+                        inputs.gas_limit,
+                        EOFCreateKind::Tx { initdata: inputs.init_code },
+                    )),
                 )?
             } else {
                 evm.handler.execution().create(&mut evm.context, Box::new(inputs))?
@@ -176,8 +127,8 @@ pub trait CheatcodesExecutor {
         })
     }
 
-    fn console_log<DB: DatabaseExt>(&mut self, ccx: &mut CheatsCtxt<DB>, message: String) {
-        self.get_inspector::<DB>(ccx.state).console_log(message);
+    fn console_log(&mut self, ccx: &mut CheatsCtxt, msg: &str) {
+        self.get_inspector(ccx.state).console_log(msg);
     }
 
     /// Returns a mutable reference to the tracing inspector if it is available.
@@ -185,14 +136,80 @@ pub trait CheatcodesExecutor {
         None
     }
 
-    fn trace_zksync<DB: DatabaseExt>(
-        &mut self,
-        ccx_state: &mut Cheatcodes,
-        ecx: &mut EvmContext<DB>,
-        call_traces: Vec<Call>,
-    ) {
-        self.get_inspector::<DB>(ccx_state).trace_zksync(ecx, call_traces);
+    fn trace_zksync(&mut self, ccx_state: &mut Cheatcodes, ecx: Ecx, call_traces: Vec<Call>) {
+        let mut inspector = self.get_inspector(ccx_state);
+
+        // We recreate the EvmContext here to satisfy the lifetime parameters as 'static, with
+        // regards to the inspector's lifetime.
+        let mut ecx_inner = EvmContext {
+            inner: InnerEvmContext {
+                env: std::mem::take(&mut ecx.env),
+                journaled_state: std::mem::replace(
+                    &mut ecx.journaled_state,
+                    revm::JournaledState::new(Default::default(), Default::default()),
+                ),
+                error: std::mem::replace(&mut ecx.error, Ok(())),
+                l1_block_info: std::mem::take(&mut ecx.l1_block_info),
+                db: &mut ecx.db as &mut dyn DatabaseExt,
+            },
+            precompiles: Default::default(),
+        };
+        inspector.trace_zksync(&mut ecx_inner, call_traces);
+
+        // re-apply the modified fields to the original ecx.
+        let env = std::mem::take(&mut ecx_inner.env);
+        let journaled_state = std::mem::replace(
+            &mut ecx_inner.journaled_state,
+            revm::JournaledState::new(Default::default(), Default::default()),
+        );
+        let error = std::mem::replace(&mut ecx_inner.error, Ok(()));
+        let l1_block_info = std::mem::take(&mut ecx_inner.l1_block_info);
+        drop(ecx_inner);
+
+        ecx.env = env;
+        ecx.journaled_state = journaled_state;
+        ecx.error = error;
+        ecx.l1_block_info = l1_block_info;
     }
+}
+
+/// Constructs [revm::Evm] and runs a given closure with it.
+fn with_evm<E, F, O>(
+    executor: &mut E,
+    ccx: &mut CheatsCtxt,
+    f: F,
+) -> Result<O, EVMError<DatabaseError>>
+where
+    E: CheatcodesExecutor + ?Sized,
+    F: for<'a, 'b> FnOnce(
+        &mut revm::Evm<'_, &'b mut dyn InspectorExt, &'a mut dyn DatabaseExt>,
+    ) -> Result<O, EVMError<DatabaseError>>,
+{
+    let mut inspector = executor.get_inspector(ccx.state);
+    let error = std::mem::replace(&mut ccx.ecx.error, Ok(()));
+    let l1_block_info = std::mem::take(&mut ccx.ecx.l1_block_info);
+
+    let inner = revm::InnerEvmContext {
+        env: ccx.ecx.env.clone(),
+        journaled_state: std::mem::replace(
+            &mut ccx.ecx.journaled_state,
+            revm::JournaledState::new(Default::default(), Default::default()),
+        ),
+        db: &mut ccx.ecx.db as &mut dyn DatabaseExt,
+        error,
+        l1_block_info,
+    };
+
+    let mut evm = new_evm_with_existing_context(inner, &mut *inspector);
+
+    let res = f(&mut evm)?;
+
+    ccx.ecx.journaled_state = evm.context.evm.inner.journaled_state;
+    ccx.ecx.env = evm.context.evm.inner.env;
+    ccx.ecx.l1_block_info = evm.context.evm.inner.l1_block_info;
+    ccx.ecx.error = evm.context.evm.inner.error;
+
+    Ok(res)
 }
 
 /// Basic implementation of [CheatcodesExecutor] that simply returns the [Cheatcodes] instance as an
@@ -201,11 +218,8 @@ pub trait CheatcodesExecutor {
 struct TransparentCheatcodesExecutor;
 
 impl CheatcodesExecutor for TransparentCheatcodesExecutor {
-    fn get_inspector<'a, DB: DatabaseExt>(
-        &'a mut self,
-        cheats: &'a mut Cheatcodes,
-    ) -> impl InspectorExt<DB> + 'a {
-        cheats
+    fn get_inspector<'a>(&'a mut self, cheats: &'a mut Cheatcodes) -> Box<dyn InspectorExt + 'a> {
+        Box::new(cheats)
     }
 }
 
@@ -247,8 +261,14 @@ pub struct BroadcastableTransaction {
     pub rpc: Option<String>,
     /// The transaction to broadcast.
     pub transaction: TransactionMaybeSigned,
-    /// ZK-VM factory deps
-    pub zk_tx: Option<ZkTransactionMetadata>,
+}
+
+#[derive(Clone, Debug, Copy)]
+pub struct RecordDebugStepInfo {
+    /// The debug trace node index when the recording starts.
+    pub start_node_idx: usize,
+    /// The original tracer config when the recording starts.
+    pub original_tracer_config: TracingInspectorConfig,
 }
 
 /// Holds gas metering state.
@@ -256,20 +276,40 @@ pub struct BroadcastableTransaction {
 pub struct GasMetering {
     /// True if gas metering is paused.
     pub paused: bool,
-    /// True if gas metering was resumed or reseted during the test.
+    /// True if gas metering was resumed or reset during the test.
     /// Used to reconcile gas when frame ends (if spent less than refunded).
     pub touched: bool,
     /// True if gas metering should be reset to frame limit.
     pub reset: bool,
-    /// Stores frames paused gas.
+    /// Stores paused gas frames.
     pub paused_frames: Vec<Gas>,
+
+    /// The group and name of the active snapshot.
+    pub active_gas_snapshot: Option<(String, String)>,
 
     /// Cache of the amount of gas used in previous call.
     /// This is used by the `lastCallGas` cheatcode.
     pub last_call_gas: Option<crate::Vm::Gas>,
+
+    /// True if gas recording is enabled.
+    pub recording: bool,
+    /// The gas used in the last frame.
+    pub last_gas_used: u64,
+    /// Gas records for the active snapshots.
+    pub gas_records: Vec<GasRecord>,
 }
 
 impl GasMetering {
+    /// Start the gas recording.
+    pub fn start(&mut self) {
+        self.recording = true;
+    }
+
+    /// Stop the gas recording.
+    pub fn stop(&mut self) {
+        self.recording = false;
+    }
+
     /// Resume paused gas metering.
     pub fn resume(&mut self) {
         if self.paused {
@@ -315,13 +355,7 @@ impl ArbitraryStorage {
     /// Saves arbitrary storage value for a given address:
     /// - store value in changed values cache.
     /// - update account's storage with given value.
-    pub fn save<DB: DatabaseExt>(
-        &mut self,
-        ecx: &mut InnerEvmContext<DB>,
-        address: Address,
-        slot: U256,
-        data: U256,
-    ) {
+    pub fn save(&mut self, ecx: InnerEcx, address: Address, slot: U256, data: U256) {
         self.values.get_mut(&address).expect("missing arbitrary address entry").insert(slot, data);
         if let Ok(mut account) = ecx.load_account(address) {
             account.storage.insert(slot, EvmStorageSlot::new(data));
@@ -333,13 +367,7 @@ impl ArbitraryStorage {
     ///   existing value.
     /// - if no value was yet generated for given slot, then save new value in cache and update both
     ///   source and target storages.
-    pub fn copy<DB: DatabaseExt>(
-        &mut self,
-        ecx: &mut InnerEvmContext<DB>,
-        target: Address,
-        slot: U256,
-        new_value: U256,
-    ) -> U256 {
+    pub fn copy(&mut self, ecx: InnerEcx, target: Address, slot: U256, new_value: U256) -> U256 {
         let source = self.copies.get(&target).expect("missing arbitrary copy target entry");
         let storage_cache = self.values.get_mut(source).expect("missing arbitrary source storage");
         let value = match storage_cache.get(&slot) {
@@ -381,13 +409,18 @@ pub type BroadcastableTransactions = VecDeque<BroadcastableTransaction>;
 ///   contract deployed on the live network is able to execute cheatcodes by simply calling the
 ///   cheatcode address: by default, the caller, test contract and newly deployed contracts are
 ///   allowed to execute cheatcodes
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct Cheatcodes {
     /// The block environment
     ///
     /// Used in the cheatcode handler to overwrite the block environment separately from the
     /// execution block environment.
     pub block: Option<BlockEnv>,
+
+    /// Currently active EIP-7702 delegation that will be consumed when building the next
+    /// transaction. Set by `vm.attachDelegation()` and consumed via `.take()` during
+    /// transaction construction.
+    pub active_delegation: Option<SignedAuthorization>,
 
     /// The gas price.
     ///
@@ -396,7 +429,7 @@ pub struct Cheatcodes {
     pub gas_price: Option<U256>,
 
     /// Address labels
-    pub labels: HashMap<Address, String>,
+    pub labels: AddressHashMap<String>,
 
     /// Prank information
     pub prank: Option<Prank>,
@@ -420,12 +453,15 @@ pub struct Cheatcodes {
     /// merged into the previous vector.
     pub recorded_account_diffs_stack: Option<Vec<Vec<AccountAccess>>>,
 
+    /// The information of the debug step recording.
+    pub record_debug_steps_info: Option<RecordDebugStepInfo>,
+
     /// Recorded logs
     pub recorded_logs: Option<Vec<crate::Vm::Log>>,
 
     /// Mocked calls
     // **Note**: inner must a BTreeMap because of special `Ord` impl for `MockCallDataContext`
-    pub mocked_calls: HashMap<Address, BTreeMap<MockCallDataContext, MockCallReturnData>>,
+    pub mocked_calls: HashMap<Address, BTreeMap<MockCallDataContext, VecDeque<MockCallReturnData>>>,
 
     /// Mocked functions. Maps target address to be mocked to pair of (calldata, mock address).
     pub mocked_functions: HashMap<Address, HashMap<Bytes, Address>>,
@@ -433,10 +469,10 @@ pub struct Cheatcodes {
     /// Expected calls
     pub expected_calls: ExpectedCallTracker,
     /// Expected emits
-    pub expected_emits: VecDeque<ExpectedEmit>,
+    pub expected_emits: ExpectedEmitTracker,
 
     /// Map of context depths to memory offset ranges that may be written to within the call depth.
-    pub allowed_mem_writes: FxHashMap<u64, Vec<Range<u64>>>,
+    pub allowed_mem_writes: HashMap<u64, Vec<Range<u64>>>,
 
     /// Current broadcasting information
     pub broadcast: Option<Broadcast>,
@@ -444,7 +480,7 @@ pub struct Cheatcodes {
     /// Scripting based transactions
     pub broadcastable_transactions: BroadcastableTransactions,
 
-    /// Additional, user configurable context this Inspector has access to when inspecting a call
+    /// Additional, user configurable context this Inspector has access to when inspecting a call.
     pub config: Arc<CheatsConfig>,
 
     /// Test-scoped context holding data that needs to be reset every test run
@@ -464,8 +500,12 @@ pub struct Cheatcodes {
     /// Gas metering state.
     pub gas_metering: GasMetering,
 
+    /// Contains gas snapshots made over the course of a test suite.
+    // **Note**: both must a BTreeMap to ensure the order of the keys is deterministic.
+    pub gas_snapshots: BTreeMap<String, BTreeMap<String, String>>,
+
     /// Mapping slots.
-    pub mapping_slots: Option<HashMap<Address, MappingSlots>>,
+    pub mapping_slots: Option<AddressHashMap<MappingSlots>>,
 
     /// The current program counter.
     pub pc: usize,
@@ -473,8 +513,9 @@ pub struct Cheatcodes {
     /// `char -> (address, pc)`
     pub breakpoints: Breakpoints,
 
-    /// Optional RNG algorithm.
-    rng: Option<StdRng>,
+    /// Optional cheatcodes `TestRunner`. Used for generating random values from uint and int
+    /// strategies.
+    test_runner: Option<TestRunner>,
 
     /// Ignored traces.
     pub ignored_traces: IgnoredTraces,
@@ -482,36 +523,55 @@ pub struct Cheatcodes {
     /// Addresses with arbitrary storage.
     pub arbitrary_storage: Option<ArbitraryStorage>,
 
-    /// Use ZK-VM to execute CALLs and CREATEs.
-    pub use_zk_vm: bool,
+    /// Deprecated cheatcodes mapped to the reason. Used to report warnings on test results.
+    pub deprecated: HashMap<&'static str, Option<&'static str>>,
+    /// Unlocked wallets used in scripts and testing of scripts.
+    pub wallets: Option<Wallets>,
 
-    /// When in zkEVM context, execute the next CALL or CREATE in the EVM instead.
-    pub skip_zk_vm: bool,
+    /// The behavior strategy.
+    pub strategy: CheatcodeInspectorStrategy,
+}
 
-    /// Any contracts that were deployed in `skip_zk_vm` step.
-    /// This makes it easier to dispatch calls to any of these addresses in zkEVM context, directly
-    /// to EVM. Alternatively, we'd need to add `vm.zkVmSkip()` to these calls manually.
-    pub skip_zk_vm_addresses: HashSet<Address>,
-
-    /// Records the next create address for `skip_zk_vm_addresses`.
-    pub record_next_create_address: bool,
-
-    /// Paymaster params
-    pub paymaster_params: Option<ZkPaymasterData>,
-
-    /// Dual compiled contracts
-    pub dual_compiled_contracts: DualCompiledContracts,
-
-    /// Starts the cheatcode inspector in ZK mode.
-    /// This is set to `false`, once the startup migration is completed.
-    pub startup_zk: bool,
-
-    /// The list of factory_deps seen so far during a test or script execution.
-    /// Ideally these would be persisted in the storage, but since modifying [revm::JournaledState]
-    /// would be a significant refactor, we maintain the factory_dep part in the [Cheatcodes].
-    /// This can be done as each test runs with its own [Cheatcodes] instance, thereby
-    /// providing the necessary level of isolation.
-    pub persisted_factory_deps: HashMap<H256, Vec<u8>>,
+impl Clone for Cheatcodes {
+    fn clone(&self) -> Self {
+        Self {
+            block: self.block.clone(),
+            active_delegation: self.active_delegation.clone(),
+            gas_price: self.gas_price,
+            labels: self.labels.clone(),
+            prank: self.prank.clone(),
+            expected_revert: self.expected_revert.clone(),
+            assume_no_revert: self.assume_no_revert.clone(),
+            fork_revert_diagnostic: self.fork_revert_diagnostic.clone(),
+            accesses: self.accesses.clone(),
+            recorded_account_diffs_stack: self.recorded_account_diffs_stack.clone(),
+            record_debug_steps_info: self.record_debug_steps_info,
+            recorded_logs: self.recorded_logs.clone(),
+            mocked_calls: self.mocked_calls.clone(),
+            mocked_functions: self.mocked_functions.clone(),
+            expected_calls: self.expected_calls.clone(),
+            expected_emits: self.expected_emits.clone(),
+            allowed_mem_writes: self.allowed_mem_writes.clone(),
+            broadcast: self.broadcast.clone(),
+            broadcastable_transactions: self.broadcastable_transactions.clone(),
+            config: self.config.clone(),
+            context: self.context.clone(),
+            fs_commit: self.fs_commit,
+            serialized_jsons: self.serialized_jsons.clone(),
+            eth_deals: self.eth_deals.clone(),
+            gas_metering: self.gas_metering.clone(),
+            gas_snapshots: self.gas_snapshots.clone(),
+            mapping_slots: self.mapping_slots.clone(),
+            pc: self.pc,
+            breakpoints: self.breakpoints.clone(),
+            test_runner: self.test_runner.clone(),
+            ignored_traces: self.ignored_traces.clone(),
+            arbitrary_storage: self.arbitrary_storage.clone(),
+            deprecated: self.deprecated.clone(),
+            wallets: self.wallets.clone(),
+            strategy: self.strategy.clone(),
+        }
+    }
 }
 
 // This is not derived because calling this in `fn new` with `..Default::default()` creates a second
@@ -526,52 +586,13 @@ impl Default for Cheatcodes {
 impl Cheatcodes {
     /// Creates a new `Cheatcodes` with the given settings.
     pub fn new(config: Arc<CheatsConfig>) -> Self {
-        let mut dual_compiled_contracts = config.dual_compiled_contracts.clone();
-
-        // We add the empty bytecode manually so it is correctly translated in zk mode.
-        // This is used in many places in foundry, e.g. in cheatcode contract's account code.
-        let empty_bytes = Bytes::from_static(&[0]);
-        let zk_bytecode_hash = foundry_zksync_core::hash_bytecode(&foundry_zksync_core::EMPTY_CODE);
-        let zk_deployed_bytecode = foundry_zksync_core::EMPTY_CODE.to_vec();
-
-        dual_compiled_contracts.push(DualCompiledContract {
-            name: String::from("EmptyEVMBytecode"),
-            zk_bytecode_hash,
-            zk_deployed_bytecode: zk_deployed_bytecode.clone(),
-            zk_factory_deps: Default::default(),
-            evm_bytecode_hash: B256::from_slice(&keccak256(&empty_bytes)[..]),
-            evm_deployed_bytecode: Bytecode::new_raw(empty_bytes.clone()).bytecode().to_vec(),
-            evm_bytecode: Bytecode::new_raw(empty_bytes).bytecode().to_vec(),
-        });
-
-        let cheatcodes_bytecode = {
-            let mut bytecode = CHEATCODE_ADDRESS.abi_encode_packed();
-            bytecode.append(&mut [0; 12].to_vec());
-            Bytes::from(bytecode)
-        };
-        dual_compiled_contracts.push(DualCompiledContract {
-            name: String::from("CheatcodeBytecode"),
-            // we put a different bytecode hash here so when importing back to EVM
-            // we avoid collision with EmptyEVMBytecode for the cheatcodes
-            zk_bytecode_hash: foundry_zksync_core::hash_bytecode(CHEATCODE_CONTRACT_HASH.as_ref()),
-            zk_deployed_bytecode: cheatcodes_bytecode.to_vec(),
-            zk_factory_deps: Default::default(),
-            evm_bytecode_hash: CHEATCODE_CONTRACT_HASH,
-            evm_deployed_bytecode: cheatcodes_bytecode.to_vec(),
-            evm_bytecode: cheatcodes_bytecode.to_vec(),
-        });
-
-        let mut persisted_factory_deps = HashMap::new();
-        persisted_factory_deps.insert(zk_bytecode_hash, zk_deployed_bytecode);
-
-        let startup_zk = config.use_zk;
         Self {
             fs_commit: true,
             labels: config.labels.clone(),
+            strategy: config.strategy.clone(),
             config,
-            dual_compiled_contracts,
-            startup_zk,
             block: Default::default(),
+            active_delegation: Default::default(),
             gas_price: Default::default(),
             prank: Default::default(),
             expected_revert: Default::default(),
@@ -580,6 +601,7 @@ impl Cheatcodes {
             accesses: Default::default(),
             recorded_account_diffs_stack: Default::default(),
             recorded_logs: Default::default(),
+            record_debug_steps_info: Default::default(),
             mocked_calls: Default::default(),
             mocked_functions: Default::default(),
             expected_calls: Default::default(),
@@ -591,32 +613,34 @@ impl Cheatcodes {
             serialized_jsons: Default::default(),
             eth_deals: Default::default(),
             gas_metering: Default::default(),
+            gas_snapshots: Default::default(),
             mapping_slots: Default::default(),
             pc: Default::default(),
             breakpoints: Default::default(),
-            rng: Default::default(),
+            test_runner: Default::default(),
             ignored_traces: Default::default(),
             arbitrary_storage: Default::default(),
-            use_zk_vm: Default::default(),
-            skip_zk_vm: Default::default(),
-            skip_zk_vm_addresses: Default::default(),
-            record_next_create_address: Default::default(),
-            persisted_factory_deps: Default::default(),
-            paymaster_params: None,
+            deprecated: Default::default(),
+            wallets: Default::default(),
         }
     }
 
-    /// Returns the configured script wallets.
-    pub fn script_wallets(&self) -> Option<&ScriptWallets> {
-        self.config.script_wallets.as_ref()
+    /// Returns the configured wallets if available, else creates a new instance.
+    pub fn wallets(&mut self) -> &Wallets {
+        self.wallets.get_or_insert_with(|| Wallets::new(MultiWallet::default(), None))
+    }
+
+    /// Sets the unlocked wallets.
+    pub fn set_wallets(&mut self, wallets: Wallets) {
+        self.wallets = Some(wallets);
     }
 
     /// Decodes the input data and applies the cheatcode.
-    fn apply_cheatcode<DB: DatabaseExt, E: CheatcodesExecutor>(
+    fn apply_cheatcode(
         &mut self,
-        ecx: &mut EvmContext<DB>,
+        ecx: Ecx,
         call: &CallInputs,
-        executor: &mut E,
+        executor: &mut dyn CheatcodesExecutor,
     ) -> Result {
         // decode the cheatcode call
         let decoded = Vm::VmCalls::abi_decode(&call.input, false).map_err(|e| {
@@ -654,12 +678,7 @@ impl Cheatcodes {
     ///
     /// There may be cheatcodes in the constructor of the new contract, in order to allow them
     /// automatically we need to determine the new address.
-    fn allow_cheatcodes_on_create<DB: DatabaseExt>(
-        &self,
-        ecx: &mut InnerEvmContext<DB>,
-        caller: Address,
-        created_address: Address,
-    ) {
+    fn allow_cheatcodes_on_create(&self, ecx: InnerEcx, caller: Address, created_address: Address) {
         if ecx.journaled_state.depth <= 1 || ecx.db.has_cheatcode_access(&caller) {
             ecx.db.allow_cheatcode_access(created_address);
         }
@@ -669,7 +688,7 @@ impl Cheatcodes {
     ///
     /// Cleanup any previously applied cheatcodes that altered the state in such a way that revm's
     /// revert would run into issues.
-    pub fn on_revert<DB: DatabaseExt>(&mut self, ecx: &mut EvmContext<DB>) {
+    pub fn on_revert(&mut self, ecx: Ecx) {
         trace!(deals=?self.eth_deals.len(), "rolling back deals");
 
         // Delay revert clean up until expected revert is handled, if set.
@@ -691,215 +710,16 @@ impl Cheatcodes {
             }
         }
     }
-    /// Selects the appropriate VM for the fork. Options: EVM, ZK-VM.
-    /// CALL and CREATE are handled by the selected VM.
-    ///
-    /// Additionally:
-    /// * Translates block information
-    /// * Translates all persisted addresses
-    pub fn select_fork_vm<DB: DatabaseExt>(
-        &mut self,
-        data: &mut InnerEvmContext<DB>,
-        fork_id: LocalForkId,
-    ) {
-        let fork_info = data.db.get_fork_info(fork_id).expect("failed getting fork info");
-        if fork_info.fork_type.is_evm() {
-            self.select_evm(data)
-        } else {
-            self.select_zk_vm(data, Some(&fork_info.fork_env))
-        }
-    }
-
-    /// Switch to EVM and translate block info, balances, nonces and deployed codes for persistent
-    /// accounts
-    pub fn select_evm<DB: DatabaseExt>(&mut self, data: &mut InnerEvmContext<DB>) {
-        if !self.use_zk_vm {
-            tracing::info!("already in EVM");
-            return
-        }
-
-        tracing::info!("switching to EVM");
-        self.use_zk_vm = false;
-
-        let system_account = SYSTEM_CONTEXT_ADDRESS.to_address();
-        journaled_account(data, system_account).expect("failed to load account");
-        let balance_account = L2_BASE_TOKEN_ADDRESS.to_address();
-        journaled_account(data, balance_account).expect("failed to load account");
-        let nonce_account = NONCE_HOLDER_ADDRESS.to_address();
-        journaled_account(data, nonce_account).expect("failed to load account");
-        let account_code_account = ACCOUNT_CODE_STORAGE_ADDRESS.to_address();
-        journaled_account(data, account_code_account).expect("failed to load account");
-
-        // TODO we might need to store the deployment nonce under the contract storage
-        // to not lose it across VMs.
-
-        let block_info_key = CURRENT_VIRTUAL_BLOCK_INFO_POSITION.to_ru256();
-        let block_info = data.sload(system_account, block_info_key).unwrap_or_default();
-        let (block_number, block_timestamp) = unpack_block_info(block_info.to_u256());
-        data.env.block.number = U256::from(block_number);
-        data.env.block.timestamp = U256::from(block_timestamp);
-
-        let test_contract = data.db.get_test_contract_address();
-        for address in data.db.persistent_accounts().into_iter().chain([data.env.tx.caller]) {
-            info!(?address, "importing to evm state");
-
-            let balance_key = get_balance_key(address);
-            let nonce_key = get_nonce_key(address);
-
-            let balance = data.sload(balance_account, balance_key).unwrap_or_default().data;
-            let full_nonce = data.sload(nonce_account, nonce_key).unwrap_or_default();
-            let (tx_nonce, _deployment_nonce) = decompose_full_nonce(full_nonce.to_u256());
-            let nonce = tx_nonce.as_u64();
-
-            let account_code_key = get_account_code_key(address);
-            let (code_hash, code) = data
-                .sload(account_code_account, account_code_key)
-                .ok()
-                .and_then(|zk_bytecode_hash| {
-                    self.dual_compiled_contracts
-                        .find_by_zk_bytecode_hash(zk_bytecode_hash.to_h256())
-                        .map(|contract| {
-                            (
-                                contract.evm_bytecode_hash,
-                                Some(Bytecode::new_raw(Bytes::from(
-                                    contract.evm_deployed_bytecode.clone(),
-                                ))),
-                            )
-                        })
-                })
-                .unwrap_or_else(|| (KECCAK_EMPTY, None));
-
-            let account = journaled_account(data, address).expect("failed to load account");
-            let _ = std::mem::replace(&mut account.info.balance, balance);
-            let _ = std::mem::replace(&mut account.info.nonce, nonce);
-
-            if test_contract.map(|addr| addr == address).unwrap_or_default() {
-                tracing::trace!(?address, "ignoring code translation for test contract");
-            } else {
-                account.info.code_hash = code_hash;
-                account.info.code.clone_from(&code);
-            }
-        }
-    }
-
-    /// Switch to ZK-VM and translate block info, balances, nonces and deployed codes for persistent
-    /// accounts
-    pub fn select_zk_vm<DB: DatabaseExt>(
-        &mut self,
-        data: &mut InnerEvmContext<DB>,
-        new_env: Option<&Env>,
-    ) {
-        if self.use_zk_vm {
-            tracing::info!("already in ZK-VM");
-            return
-        }
-
-        tracing::info!("switching to ZK-VM");
-        self.use_zk_vm = true;
-
-        let env = new_env.unwrap_or(data.env.as_ref());
-
-        let mut system_storage: rHashMap<U256, EvmStorageSlot> = Default::default();
-        let block_info_key = CURRENT_VIRTUAL_BLOCK_INFO_POSITION.to_ru256();
-        let block_info =
-            pack_block_info(env.block.number.as_limbs()[0], env.block.timestamp.as_limbs()[0]);
-        system_storage.insert(block_info_key, EvmStorageSlot::new(block_info.to_ru256()));
-
-        let mut l2_eth_storage: rHashMap<U256, EvmStorageSlot> = Default::default();
-        let mut nonce_storage: rHashMap<U256, EvmStorageSlot> = Default::default();
-        let mut account_code_storage: rHashMap<U256, EvmStorageSlot> = Default::default();
-        let mut known_codes_storage: rHashMap<U256, EvmStorageSlot> = Default::default();
-        let mut deployed_codes: HashMap<Address, AccountInfo> = Default::default();
-
-        for address in data.db.persistent_accounts().into_iter().chain([data.env.tx.caller]) {
-            info!(?address, "importing to zk state");
-
-            let account = journaled_account(data, address).expect("failed to load account");
-            let info = &account.info;
-
-            let balance_key = get_balance_key(address);
-            l2_eth_storage.insert(balance_key, EvmStorageSlot::new(info.balance));
-
-            // TODO we need to find a proper way to handle deploy nonces instead of replicating
-            let full_nonce = nonces_to_full_nonce(info.nonce.into(), info.nonce.into());
-
-            let nonce_key = get_nonce_key(address);
-            nonce_storage.insert(nonce_key, EvmStorageSlot::new(full_nonce.to_ru256()));
-
-            if let Some(contract) = self.dual_compiled_contracts.iter().find(|contract| {
-                info.code_hash != KECCAK_EMPTY && info.code_hash == contract.evm_bytecode_hash
-            }) {
-                account_code_storage.insert(
-                    get_account_code_key(address),
-                    EvmStorageSlot::new(contract.zk_bytecode_hash.to_ru256()),
-                );
-                known_codes_storage
-                    .insert(contract.zk_bytecode_hash.to_ru256(), EvmStorageSlot::new(U256::ZERO));
-
-                let code_hash = B256::from_slice(contract.zk_bytecode_hash.as_bytes());
-                deployed_codes.insert(
-                    address,
-                    AccountInfo {
-                        balance: info.balance,
-                        nonce: info.nonce,
-                        code_hash,
-                        code: Some(Bytecode::new_raw(Bytes::from(
-                            contract.zk_deployed_bytecode.clone(),
-                        ))),
-                    },
-                );
-            } else {
-                tracing::debug!(code_hash = ?info.code_hash, ?address, "no zk contract found")
-            }
-        }
-
-        let system_addr = SYSTEM_CONTEXT_ADDRESS.to_address();
-        let system_account = journaled_account(data, system_addr).expect("failed to load account");
-        system_account.storage.extend(system_storage.clone());
-
-        let balance_addr = L2_BASE_TOKEN_ADDRESS.to_address();
-        let balance_account =
-            journaled_account(data, balance_addr).expect("failed to load account");
-        balance_account.storage.extend(l2_eth_storage.clone());
-
-        let nonce_addr = NONCE_HOLDER_ADDRESS.to_address();
-        let nonce_account = journaled_account(data, nonce_addr).expect("failed to load account");
-        nonce_account.storage.extend(nonce_storage.clone());
-
-        let account_code_addr = ACCOUNT_CODE_STORAGE_ADDRESS.to_address();
-        let account_code_account =
-            journaled_account(data, account_code_addr).expect("failed to load account");
-        account_code_account.storage.extend(account_code_storage.clone());
-
-        let known_codes_addr = KNOWN_CODES_STORAGE_ADDRESS.to_address();
-        let known_codes_account =
-            journaled_account(data, known_codes_addr).expect("failed to load account");
-        known_codes_account.storage.extend(known_codes_storage.clone());
-
-        let test_contract = data.db.get_test_contract_address();
-        for (address, info) in deployed_codes {
-            let account = journaled_account(data, address).expect("failed to load account");
-            let _ = std::mem::replace(&mut account.info.balance, info.balance);
-            let _ = std::mem::replace(&mut account.info.nonce, info.nonce);
-            if test_contract.map(|addr| addr == address).unwrap_or_default() {
-                tracing::trace!(?address, "ignoring code translation for test contract");
-            } else {
-                account.info.code_hash = info.code_hash;
-                account.info.code.clone_from(&info.code);
-            }
-        }
-    }
 
     // common create functionality for both legacy and EOF.
-    fn create_common<DB, Input>(
+    fn create_common<Input>(
         &mut self,
-        ecx: &mut EvmContext<DB>,
+        ecx: Ecx,
         mut input: Input,
         executor: &mut impl CheatcodesExecutor,
     ) -> Option<CreateOutcome>
     where
-        DB: DatabaseExt,
-        Input: CommonCreateInput<DB>,
+        Input: CommonCreateInput,
     {
         let ecx_inner = &mut ecx.inner;
         let gas = Gas::new(input.gas_limit());
@@ -943,94 +763,15 @@ impl Cheatcodes {
 
                 if ecx_inner.journaled_state.depth() == broadcast.depth {
                     input.set_caller(broadcast.new_origin);
-                    let is_fixed_gas_limit = check_if_fixed_gas_limit(ecx_inner, input.gas_limit());
 
-                    let mut to = None;
-                    let mut nonce: u64 =
-                        ecx_inner.journaled_state.state()[&broadcast.new_origin].info.nonce;
-                    //drop the mutable borrow of account
-                    let mut call_init_code = input.init_code();
-                    let mut zk_tx = if self.use_zk_vm {
-                        to = Some(TxKind::Call(CONTRACT_DEPLOYER_ADDRESS.to_address()));
-                        nonce = foundry_zksync_core::nonce(broadcast.new_origin, ecx_inner) as u64;
-                        let contract = self
-                            .dual_compiled_contracts
-                            .find_by_evm_bytecode(&input.init_code().0)
-                            .unwrap_or_else(|| {
-                                panic!("failed finding contract for {:?}", input.init_code())
-                            });
-                        let factory_deps =
-                            self.dual_compiled_contracts.fetch_all_factory_deps(contract);
-
-                        let constructor_input =
-                            call_init_code[contract.evm_bytecode.len()..].to_vec();
-
-                        let create_input = foundry_zksync_core::encode_create_params(
-                            &input.scheme().unwrap_or(CreateScheme::Create),
-                            contract.zk_bytecode_hash,
-                            constructor_input,
-                        );
-                        call_init_code = Bytes::from(create_input);
-
-                        Some(factory_deps)
-                    } else {
-                        None
-                    };
-                    let rpc = ecx_inner.db.active_fork_url();
-                    let paymaster_params =
-                        self.paymaster_params.clone().map(|paymaster_data| PaymasterParams {
-                            paymaster: paymaster_data.address.to_h160(),
-                            paymaster_input: paymaster_data.input.to_vec(),
-                        });
-                    if let Some(factory_deps) = zk_tx {
-                        let mut batched =
-                            foundry_zksync_core::vm::batch_factory_dependencies(factory_deps);
-                        debug!(batches = batched.len(), "splitting factory deps for broadcast");
-                        // the last batch is the final one that does the deployment
-                        zk_tx = batched.pop();
-
-                        for factory_deps in batched {
-                            self.broadcastable_transactions.push_back(BroadcastableTransaction {
-                                rpc: rpc.clone(),
-                                transaction: TransactionRequest {
-                                    from: Some(broadcast.new_origin),
-                                    to: Some(TxKind::Call(Address::ZERO)),
-                                    value: Some(input.value()),
-                                    nonce: Some(nonce),
-                                    ..Default::default()
-                                }
-                                .into(),
-                                zk_tx: Some(ZkTransactionMetadata {
-                                    factory_deps,
-                                    paymaster_data: paymaster_params.clone(),
-                                }),
-                            });
-
-                            //update nonce for each tx
-                            nonce += 1;
-                        }
-                    }
-
-                    self.broadcastable_transactions.push_back(BroadcastableTransaction {
-                        rpc,
-                        transaction: TransactionRequest {
-                            from: Some(broadcast.new_origin),
-                            to,
-                            value: Some(input.value()),
-                            input: TransactionInput::new(call_init_code),
-                            nonce: Some(nonce),
-                            gas: if is_fixed_gas_limit {
-                                Some(input.gas_limit() as u128)
-                            } else {
-                                None
-                            },
-                            ..Default::default()
-                        }
-                        .into(),
-                        zk_tx: zk_tx.map(|factory_deps| {
-                            ZkTransactionMetadata::new(factory_deps, paymaster_params)
-                        }),
-                    });
+                    self.strategy.runner.record_broadcastable_create_transactions(
+                        self.strategy.context.as_mut(),
+                        self.config.clone(),
+                        &input,
+                        ecx_inner,
+                        broadcast,
+                        &mut self.broadcastable_transactions,
+                    );
 
                     input.log_debug(self, &input.scheme().unwrap_or(CreateScheme::Create));
                 }
@@ -1062,190 +803,16 @@ impl Cheatcodes {
             }]);
         }
 
-        if self.use_zk_vm {
-            if let Some(result) = self.try_create_in_zk(ecx, input, executor) {
-                return Some(result);
-            }
+        if let Some(result) = self.strategy.runner.zksync_try_create(self, ecx, &input, executor) {
+            return Some(result);
         }
 
         None
     }
 
-    /// Try handling the `CREATE` within zkEVM.
-    /// If `Some` is returned then the result must be returned immediately, else the call must be
-    /// handled in EVM.
-    fn try_create_in_zk<DB, Input>(
-        &mut self,
-        ecx: &mut EvmContext<DB>,
-        input: Input,
-        executor: &mut impl CheatcodesExecutor,
-    ) -> Option<CreateOutcome>
-    where
-        DB: DatabaseExt,
-        Input: CommonCreateInput<DB>,
-    {
-        if self.skip_zk_vm {
-            self.skip_zk_vm = false; // handled the skip, reset flag
-            self.record_next_create_address = true;
-            info!("running create in EVM, instead of zkEVM (skipped)");
-            return None
-        }
-
-        if let Some(CreateScheme::Create) = input.scheme() {
-            let caller = input.caller();
-            let nonce = ecx
-                .inner
-                .journaled_state
-                .load_account(input.caller(), &mut ecx.inner.db)
-                .expect("to load caller account")
-                .info
-                .nonce;
-            let address = caller.create(nonce);
-            if ecx.db.get_test_contract_address().map(|addr| address == addr).unwrap_or_default() {
-                info!("running create in EVM, instead of zkEVM (Test Contract) {:#?}", address);
-                return None
-            }
-        }
-
-        if input.init_code().0 == DEFAULT_CREATE2_DEPLOYER_CODE {
-            info!("running create in EVM, instead of zkEVM (DEFAULT_CREATE2_DEPLOYER_CODE)");
-            return None
-        }
-
-        info!("running create in zkEVM");
-
-        let zk_contract = self
-            .dual_compiled_contracts
-            .find_by_evm_bytecode(&input.init_code().0)
-            .unwrap_or_else(|| panic!("failed finding contract for {:?}", input.init_code()));
-
-        let factory_deps = self.dual_compiled_contracts.fetch_all_factory_deps(zk_contract);
-        tracing::debug!(contract = zk_contract.name, "using dual compiled contract");
-
-        let ccx = foundry_zksync_core::vm::CheatcodeTracerContext {
-            mocked_calls: self.mocked_calls.clone(),
-            expected_calls: Some(&mut self.expected_calls),
-            accesses: self.accesses.as_mut(),
-            persisted_factory_deps: Some(&mut self.persisted_factory_deps),
-            paymaster_data: self.paymaster_params.take(),
-        };
-        let create_inputs = CreateInputs {
-            scheme: input.scheme().unwrap_or(CreateScheme::Create),
-            init_code: input.init_code(),
-            value: input.value(),
-            caller: input.caller(),
-            gas_limit: input.gas_limit(),
-        };
-
-        let mut gas = Gas::new(input.gas_limit());
-        match foundry_zksync_core::vm::create::<_, DatabaseError>(
-            &create_inputs,
-            zk_contract,
-            factory_deps,
-            ecx,
-            ccx,
-        ) {
-            Ok(result) => {
-                if let Some(recorded_logs) = &mut self.recorded_logs {
-                    recorded_logs.extend(result.logs.clone().into_iter().map(|log| Vm::Log {
-                        topics: log.data.topics().to_vec(),
-                        data: log.data.data.clone(),
-                        emitter: log.address,
-                    }));
-                }
-
-                // append console logs from zkEVM to the current executor's LogTracer
-                result.logs.iter().filter_map(decode_console_log).for_each(|decoded_log| {
-                    executor.console_log(
-                        &mut CheatsCtxt {
-                            state: self,
-                            ecx: &mut ecx.inner,
-                            precompiles: &mut ecx.precompiles,
-                            gas_limit: create_inputs.gas_limit,
-                            caller: create_inputs.caller,
-                        },
-                        decoded_log,
-                    );
-                });
-
-                // append traces
-                executor.trace_zksync(self, ecx, result.call_traces);
-
-                // for each log in cloned logs call handle_expect_emit
-                if !self.expected_emits.is_empty() {
-                    for log in result.logs {
-                        expect::handle_expect_emit(self, &log, &mut Default::default());
-                    }
-                }
-
-                match result.execution_result {
-                    ExecutionResult::Success { output, gas_used, .. } => {
-                        let _ = gas.record_cost(gas_used);
-                        match output {
-                            Output::Create(bytes, address) => Some(CreateOutcome {
-                                result: InterpreterResult {
-                                    result: InstructionResult::Return,
-                                    output: bytes,
-                                    gas,
-                                },
-                                address,
-                            }),
-                            _ => Some(CreateOutcome {
-                                result: InterpreterResult {
-                                    result: InstructionResult::Revert,
-                                    output: Bytes::new(),
-                                    gas,
-                                },
-                                address: None,
-                            }),
-                        }
-                    }
-                    ExecutionResult::Revert { output, gas_used, .. } => {
-                        let _ = gas.record_cost(gas_used);
-                        Some(CreateOutcome {
-                            result: InterpreterResult {
-                                result: InstructionResult::Revert,
-                                output,
-                                gas,
-                            },
-                            address: None,
-                        })
-                    }
-                    ExecutionResult::Halt { .. } => Some(CreateOutcome {
-                        result: InterpreterResult {
-                            result: InstructionResult::Revert,
-                            output: Bytes::from_iter(String::from("zk vm halted").as_bytes()),
-                            gas,
-                        },
-                        address: None,
-                    }),
-                }
-            }
-            Err(err) => {
-                error!("error inspecting zkEVM: {err:?}");
-                Some(CreateOutcome {
-                    result: InterpreterResult {
-                        result: InstructionResult::Revert,
-                        output: Bytes::from_iter(
-                            format!("error inspecting zkEVM: {err:?}").as_bytes(),
-                        ),
-                        gas,
-                    },
-                    address: None,
-                })
-            }
-        }
-    }
-
     // common create_end functionality for both legacy and EOF.
-    fn create_end_common<DB>(
-        &mut self,
-        ecx: &mut EvmContext<DB>,
-        mut outcome: CreateOutcome,
-    ) -> CreateOutcome
-    where
-        DB: DatabaseExt,
-    {
+    fn create_end_common(&mut self, ecx: Ecx, mut outcome: CreateOutcome) -> CreateOutcome
+where {
         let ecx = &mut ecx.inner;
 
         // Clean up pranks
@@ -1277,16 +844,22 @@ impl Cheatcodes {
             if ecx.journaled_state.depth() <= expected_revert.depth &&
                 matches!(expected_revert.kind, ExpectedRevertKind::Default)
             {
-                let expected_revert = std::mem::take(&mut self.expected_revert).unwrap();
-                return match expect::handle_expect_revert(
+                let mut expected_revert = std::mem::take(&mut self.expected_revert).unwrap();
+                return match revert_handlers::handle_expect_revert(
                     false,
                     true,
+                    self.config.internal_expect_revert,
                     &expected_revert,
                     outcome.result.result,
                     outcome.result.output.clone(),
                     &self.config.available_artifacts,
                 ) {
                     Ok((address, retdata)) => {
+                        expected_revert.actual_count += 1;
+                        if expected_revert.actual_count < expected_revert.count {
+                            self.expected_revert = Some(expected_revert.clone());
+                        }
+
                         outcome.result.result = InstructionResult::Return;
                         outcome.result.output = retdata;
                         outcome.address = address;
@@ -1350,58 +923,57 @@ impl Cheatcodes {
             }
         }
 
-        if self.record_next_create_address {
-            self.record_next_create_address = false;
-            if let Some(address) = outcome.address {
-                self.skip_zk_vm_addresses.insert(address);
-            }
-        }
+        self.strategy.runner.zksync_record_create_address(self.strategy.context.as_mut(), &outcome);
 
         outcome
     }
 
-    pub fn create_with_executor<DB: DatabaseExt>(
+    pub fn create_with_executor(
         &mut self,
-        ecx: &mut EvmContext<DB>,
+        ecx: Ecx,
         call: &mut CreateInputs,
         executor: &mut impl CheatcodesExecutor,
     ) -> Option<CreateOutcome> {
         self.create_common(ecx, call, executor)
     }
 
-    pub fn call_with_executor<DB: DatabaseExt>(
+    pub fn call_with_executor(
         &mut self,
-        ecx: &mut EvmContext<DB>,
+        ecx: Ecx,
         call: &mut CallInputs,
         executor: &mut impl CheatcodesExecutor,
     ) -> Option<CallOutcome> {
-        let ecx_inner = &mut ecx.inner;
         let gas = Gas::new(call.gas_limit);
 
         // At the root call to test function or script `run()`/`setUp()` functions, we are
         // decreasing sender nonce to ensure that it matches on-chain nonce once we start
         // broadcasting.
-        if ecx_inner.journaled_state.depth == 0 {
-            let sender = ecx_inner.env.tx.caller;
-            if sender != Config::DEFAULT_SENDER {
-                let account = match super::evm::journaled_account(ecx_inner, sender) {
-                    Ok(account) => account,
-                    Err(err) => {
-                        return Some(CallOutcome {
-                            result: InterpreterResult {
-                                result: InstructionResult::Revert,
-                                output: err.abi_encode().into(),
-                                gas,
-                            },
-                            memory_offset: call.return_memory_offset.clone(),
-                        })
-                    }
-                };
-                let prev = account.info.nonce;
-                account.info.nonce = prev.saturating_sub(1);
+        if ecx.journaled_state.depth == 0 {
+            let sender = ecx.env.tx.caller;
+            let account = match super::evm::journaled_account(ecx, sender) {
+                Ok(account) => account,
+                Err(err) => {
+                    return Some(CallOutcome {
+                        result: InterpreterResult {
+                            result: InstructionResult::Revert,
+                            output: err.abi_encode().into(),
+                            gas,
+                        },
+                        memory_offset: call.return_memory_offset.clone(),
+                    })
+                }
+            };
+            let prev = account.info.nonce;
+            let nonce = prev.saturating_sub(1);
+            account.info.nonce = nonce;
+            self.strategy.runner.zksync_sync_nonce(
+                self.strategy.context.as_mut(),
+                sender,
+                nonce,
+                ecx,
+            );
 
-                trace!(target: "cheatcodes", %sender, nonce=account.info.nonce, prev, "corrected nonce");
-            }
+            trace!(target: "cheatcodes", %sender, nonce, prev, "corrected nonce");
         }
 
         if call.target_address == CHEATCODE_ADDRESS {
@@ -1425,34 +997,15 @@ impl Cheatcodes {
             };
         }
 
+        // NOTE(zk): renamed from `ecx` because we need the full one later
+        // and this helps with borrow checker
+        let ecx_inner = &mut ecx.inner;
+
         if call.target_address == HARDHAT_CONSOLE_ADDRESS {
             return None;
         }
 
-        let mut factory_deps = Vec::new();
-
-        if call.target_address == DEFAULT_CREATE2_DEPLOYER && self.use_zk_vm {
-            call.target_address = DEFAULT_CREATE2_DEPLOYER_ZKSYNC;
-            call.bytecode_address = DEFAULT_CREATE2_DEPLOYER_ZKSYNC;
-
-            let (salt, init_code) = call.input.split_at(32);
-            let contract = self
-                .dual_compiled_contracts
-                .find_by_evm_bytecode(init_code)
-                .unwrap_or_else(|| panic!("failed finding contract for {init_code:?}"));
-
-            factory_deps = self.dual_compiled_contracts.fetch_all_factory_deps(contract);
-
-            let constructor_input = init_code[contract.evm_bytecode.len()..].to_vec();
-
-            let create_input = foundry_zksync_core::encode_create_params(
-                &CreateScheme::Create2 { salt: U256::from_be_slice(salt) },
-                contract.zk_bytecode_hash,
-                constructor_input,
-            );
-
-            call.input = create_input.into();
-        }
+        self.strategy.runner.zksync_set_deployer_call_input(self.strategy.context.as_mut(), call);
 
         // Handle expected calls
 
@@ -1468,12 +1021,11 @@ impl Cheatcodes {
                     *calldata == call.input[..calldata.len()] &&
                     // The value matches, if provided
                     expected
-                        .value
-                        .map_or(true, |value| Some(value) == call.transfer_value()) &&
+                        .value.is_none_or(|value| Some(value) == call.transfer_value()) &&
                     // The gas matches, if provided
-                    expected.gas.map_or(true, |gas| gas == call.gas_limit) &&
+                    expected.gas.is_none_or(|gas| gas == call.gas_limit) &&
                     // The minimum gas matches, if provided
-                    expected.min_gas.map_or(true, |min_gas| min_gas <= call.gas_limit)
+                    expected.min_gas.is_none_or(|min_gas| min_gas <= call.gas_limit)
                 {
                     *actual_count += 1;
                 }
@@ -1481,31 +1033,57 @@ impl Cheatcodes {
         }
 
         // Handle mocked calls
-        if let Some(mocks) = self.mocked_calls.get(&call.bytecode_address) {
+        if let Some(mocks) = self.mocked_calls.get_mut(&call.bytecode_address) {
             let ctx =
                 MockCallDataContext { calldata: call.input.clone(), value: call.transfer_value() };
-            if let Some(return_data) = mocks.get(&ctx).or_else(|| {
-                mocks
-                    .iter()
+
+            if let Some(return_data_queue) = match mocks.get_mut(&ctx) {
+                Some(queue) => Some(queue),
+                None => mocks
+                    .iter_mut()
                     .find(|(mock, _)| {
                         call.input.get(..mock.calldata.len()) == Some(&mock.calldata[..]) &&
-                            mock.value.map_or(true, |value| Some(value) == call.transfer_value())
+                            mock.value.is_none_or(|value| Some(value) == call.transfer_value())
                     })
-                    .map(|(_, v)| v)
-            }) {
-                return Some(CallOutcome {
-                    result: InterpreterResult {
-                        result: return_data.ret_type,
-                        output: return_data.data.clone(),
-                        gas,
-                    },
-                    memory_offset: call.return_memory_offset.clone(),
-                });
+                    .map(|(_, v)| v),
+            } {
+                if let Some(return_data) = if return_data_queue.len() == 1 {
+                    // If the mocked calls stack has a single element in it, don't empty it
+                    return_data_queue.front().map(|x| x.to_owned())
+                } else {
+                    // Else, we pop the front element
+                    return_data_queue.pop_front()
+                } {
+                    return Some(CallOutcome {
+                        result: InterpreterResult {
+                            result: return_data.ret_type,
+                            output: return_data.data,
+                            gas,
+                        },
+                        memory_offset: call.return_memory_offset.clone(),
+                    });
+                }
             }
         }
 
         // Apply our prank
         if let Some(prank) = &self.prank {
+            // Apply delegate call, `call.caller`` will not equal `prank.prank_caller`
+            // TODO(zk): support delegatecall prank
+            if let CallScheme::DelegateCall | CallScheme::ExtDelegateCall = call.scheme {
+                if prank.delegate_call {
+                    call.target_address = prank.new_caller;
+                    call.caller = prank.new_caller;
+                    // NOTE(zk): ecx_inner vs upstream's ecx used here
+                    let acc = ecx_inner.journaled_state.account(prank.new_caller);
+                    call.value = CallValue::Apparent(acc.info.balance);
+                    if let Some(new_origin) = prank.new_origin {
+                        ecx_inner.env.tx.caller = new_origin;
+                    }
+                }
+            }
+
+            // NOTE(zk): ecx_inner vs upstream's ecx used here
             if ecx_inner.journaled_state.depth() >= prank.depth && call.caller == prank.prank_caller
             {
                 let mut prank_applied = false;
@@ -1562,61 +1140,18 @@ impl Cheatcodes {
                         })
                     }
 
-                    let is_fixed_gas_limit = check_if_fixed_gas_limit(ecx_inner, call.gas_limit);
+                    self.strategy.runner.record_broadcastable_call_transactions(
+                        self.strategy.context.as_mut(),
+                        self.config.clone(),
+                        call,
+                        ecx_inner,
+                        broadcast,
+                        &mut self.broadcastable_transactions,
+                        &mut self.active_delegation,
+                    );
 
                     let account =
                         ecx_inner.journaled_state.state().get_mut(&broadcast.new_origin).unwrap();
-
-                    let nonce = if self.use_zk_vm {
-                        foundry_zksync_core::nonce(broadcast.new_origin, ecx_inner) as u64
-                    } else {
-                        account.info.nonce
-                    };
-
-                    let account =
-                        ecx_inner.journaled_state.state().get_mut(&broadcast.new_origin).unwrap();
-
-                    let zk_tx = if self.use_zk_vm {
-                        let paymaster_params =
-                            self.paymaster_params.clone().map(|paymaster_data| PaymasterParams {
-                                paymaster: paymaster_data.address.to_h160(),
-                                paymaster_input: paymaster_data.input.to_vec(),
-                            });
-                        // We shouldn't need factory_deps for CALLs
-                        if call.target_address == DEFAULT_CREATE2_DEPLOYER_ZKSYNC {
-                            Some(ZkTransactionMetadata {
-                                factory_deps: factory_deps.clone(),
-                                paymaster_data: paymaster_params,
-                            })
-                        } else {
-                            Some(ZkTransactionMetadata {
-                                factory_deps: Default::default(),
-                                paymaster_data: paymaster_params,
-                            })
-                        }
-                    } else {
-                        None
-                    };
-
-                    self.broadcastable_transactions.push_back(BroadcastableTransaction {
-                        rpc: ecx_inner.db.active_fork_url(),
-                        transaction: TransactionRequest {
-                            from: Some(broadcast.new_origin),
-                            to: Some(TxKind::from(Some(call.target_address))),
-                            value: call.transfer_value(),
-                            input: TransactionInput::new(call.input.clone()),
-                            nonce: Some(nonce),
-                            gas: if is_fixed_gas_limit {
-                                Some(call.gas_limit as u128)
-                            } else {
-                                None
-                            },
-                            ..Default::default()
-                        }
-                        .into(),
-                        zk_tx,
-                    });
-                    debug!(target: "cheatcodes", tx=?self.broadcastable_transactions.back().unwrap(), "broadcastable call");
 
                     // Explicitly increment nonce if calls are not isolated.
                     if !self.config.evm_opts.isolate {
@@ -1645,7 +1180,7 @@ impl Cheatcodes {
             // nonce, a non-zero KECCAK_EMPTY codehash, or non-empty code
             let initialized;
             let old_balance;
-            if let Ok(acc) = ecx.load_account(call.target_address) {
+            if let Ok(acc) = ecx_inner.load_account(call.target_address) {
                 initialized = acc.info.exists();
                 old_balance = acc.info.balance;
             } else {
@@ -1668,8 +1203,8 @@ impl Cheatcodes {
             // as "warm" if the call from which they were accessed is reverted
             recorded_account_diffs_stack.push(vec![AccountAccess {
                 chainInfo: crate::Vm::ChainInfo {
-                    forkId: ecx.db.active_fork_id().unwrap_or_default(),
-                    chainId: U256::from(ecx.env.cfg.chain_id),
+                    forkId: ecx_inner.db.active_fork_id().unwrap_or_default(),
+                    chainId: U256::from(ecx_inner.env.cfg.chain_id),
                 },
                 accessor: call.caller,
                 account: call.bytecode_address,
@@ -1682,165 +1217,28 @@ impl Cheatcodes {
                 reverted: false,
                 deployedCode: Bytes::new(),
                 storageAccesses: vec![], // updated on step
-                depth: ecx.journaled_state.depth(),
+                depth: ecx_inner.journaled_state.depth(),
             }]);
         }
 
-        if self.use_zk_vm {
-            if let Some(result) = self.try_call_in_zk(factory_deps, ecx, call, executor) {
-                return Some(result);
-            }
+        if let Some(result) = self.strategy.runner.zksync_try_call(self, ecx, call, executor) {
+            return Some(result);
         }
 
         None
     }
 
-    /// Try handling the `CALL` within zkEVM.
-    /// If `Some` is returned then the result must be returned immediately, else the call must be
-    /// handled in EVM.
-    fn try_call_in_zk<DB>(
-        &mut self,
-        factory_deps: Vec<Vec<u8>>,
-        ecx: &mut EvmContext<DB>,
-        call: &mut CallInputs,
-        executor: &mut impl CheatcodesExecutor,
-    ) -> Option<CallOutcome>
-    where
-        DB: DatabaseExt,
-    {
-        // also skip if the target was created during a zkEVM skip
-        self.skip_zk_vm =
-            self.skip_zk_vm || self.skip_zk_vm_addresses.contains(&call.target_address);
-        if self.skip_zk_vm {
-            self.skip_zk_vm = false; // handled the skip, reset flag
-            info!("running create in EVM, instead of zkEVM (skipped) {:#?}", call);
-            return None;
-        }
-
-        if ecx
-            .db
-            .get_test_contract_address()
-            .map(|addr| call.bytecode_address == addr)
-            .unwrap_or_default()
-        {
-            info!(
-                "running call in EVM, instead of zkEVM (Test Contract) {:#?}",
-                call.bytecode_address
-            );
-            return None
-        }
-
-        info!("running call in zkEVM {:#?}", call);
-
-        let ccx = foundry_zksync_core::vm::CheatcodeTracerContext {
-            mocked_calls: self.mocked_calls.clone(),
-            expected_calls: Some(&mut self.expected_calls),
-            accesses: self.accesses.as_mut(),
-            persisted_factory_deps: Some(&mut self.persisted_factory_deps),
-            paymaster_data: self.paymaster_params.take(),
-        };
-
-        let mut gas = Gas::new(call.gas_limit);
-        match foundry_zksync_core::vm::call::<_, DatabaseError>(call, factory_deps, ecx, ccx) {
-            Ok(result) => {
-                // append console logs from zkEVM to the current executor's LogTracer
-                result.logs.iter().filter_map(decode_console_log).for_each(|decoded_log| {
-                    executor.console_log(
-                        &mut CheatsCtxt {
-                            state: self,
-                            ecx: &mut ecx.inner,
-                            precompiles: &mut ecx.precompiles,
-                            gas_limit: call.gas_limit,
-                            caller: call.caller,
-                        },
-                        decoded_log,
-                    );
-                });
-
-                // skip log processing for static calls
-                if !call.is_static {
-                    if let Some(recorded_logs) = &mut self.recorded_logs {
-                        recorded_logs.extend(result.logs.clone().into_iter().map(|log| Vm::Log {
-                            topics: log.data.topics().to_vec(),
-                            data: log.data.data.clone(),
-                            emitter: log.address,
-                        }));
-                    }
-
-                    // append traces
-                    executor.trace_zksync(self, ecx, result.call_traces);
-
-                    // for each log in cloned logs call handle_expect_emit
-                    if !self.expected_emits.is_empty() {
-                        for log in result.logs {
-                            expect::handle_expect_emit(self, &log, &mut Default::default());
-                        }
-                    }
-                }
-
-                match result.execution_result {
-                    ExecutionResult::Success { output, gas_used, .. } => {
-                        let _ = gas.record_cost(gas_used);
-                        match output {
-                            Output::Call(bytes) => Some(CallOutcome {
-                                result: InterpreterResult {
-                                    result: InstructionResult::Return,
-                                    output: bytes,
-                                    gas,
-                                },
-                                memory_offset: call.return_memory_offset.clone(),
-                            }),
-                            _ => Some(CallOutcome {
-                                result: InterpreterResult {
-                                    result: InstructionResult::Revert,
-                                    output: Bytes::new(),
-                                    gas,
-                                },
-                                memory_offset: call.return_memory_offset.clone(),
-                            }),
-                        }
-                    }
-                    ExecutionResult::Revert { output, gas_used, .. } => {
-                        let _ = gas.record_cost(gas_used);
-                        Some(CallOutcome {
-                            result: InterpreterResult {
-                                result: InstructionResult::Revert,
-                                output,
-                                gas,
-                            },
-                            memory_offset: call.return_memory_offset.clone(),
-                        })
-                    }
-                    ExecutionResult::Halt { .. } => Some(CallOutcome {
-                        result: InterpreterResult {
-                            result: InstructionResult::Revert,
-                            output: Bytes::from_iter(String::from("zk vm halted").as_bytes()),
-                            gas,
-                        },
-                        memory_offset: call.return_memory_offset.clone(),
-                    }),
-                }
-            }
-            Err(err) => {
-                error!("error inspecting zkEVM: {err:?}");
-                Some(CallOutcome {
-                    result: InterpreterResult {
-                        result: InstructionResult::Revert,
-                        output: Bytes::from_iter(
-                            format!("error inspecting zkEVM: {err:?}").as_bytes(),
-                        ),
-                        gas,
-                    },
-                    memory_offset: call.return_memory_offset.clone(),
-                })
-            }
-        }
+    pub fn rng(&mut self) -> &mut impl Rng {
+        self.test_runner().rng()
     }
 
-    pub fn rng(&mut self) -> &mut impl Rng {
-        self.rng.get_or_insert_with(|| match self.config.seed {
-            Some(seed) => StdRng::from_seed(seed.to_be_bytes::<32>()),
-            None => StdRng::from_entropy(),
+    pub fn test_runner(&mut self) -> &mut TestRunner {
+        self.test_runner.get_or_insert_with(|| match self.config.seed {
+            Some(seed) => TestRunner::new_with_rng(
+                proptest::test_runner::Config::default(),
+                TestRng::from_seed(RngAlgorithm::ChaCha, &seed.to_be_bytes::<32>()),
+            ),
+            None => TestRunner::new(proptest::test_runner::Config::default()),
         })
     }
 
@@ -1867,9 +1265,9 @@ impl Cheatcodes {
     }
 }
 
-impl<DB: DatabaseExt> Inspector<DB> for Cheatcodes {
+impl Inspector<&mut dyn DatabaseExt> for Cheatcodes {
     #[inline]
-    fn initialize_interp(&mut self, interpreter: &mut Interpreter, ecx: &mut EvmContext<DB>) {
+    fn initialize_interp(&mut self, interpreter: &mut Interpreter, ecx: Ecx) {
         // When the first interpreter is initialized we've circumvented the balance and gas checks,
         // so we apply our actual block data with the correct fees and all.
         if let Some(block) = self.block.take() {
@@ -1879,19 +1277,25 @@ impl<DB: DatabaseExt> Inspector<DB> for Cheatcodes {
             ecx.env.tx.gas_price = gas_price;
         }
 
-        if self.startup_zk && !self.use_zk_vm {
-            self.startup_zk = false; // We only do this once.
-            self.select_zk_vm(ecx, None);
-        }
-
         // Record gas for current frame.
         if self.gas_metering.paused {
             self.gas_metering.paused_frames.push(interpreter.gas);
         }
+
+        // `expectRevert`: track the max call depth during `expectRevert`
+        if let Some(expected) = &mut self.expected_revert {
+            expected.max_depth = max(ecx.journaled_state.depth(), expected.max_depth);
+        }
+
+        self.strategy.runner.post_initialize_interp(
+            self.strategy.context.as_mut(),
+            interpreter,
+            ecx,
+        );
     }
 
     #[inline]
-    fn step(&mut self, interpreter: &mut Interpreter, ecx: &mut EvmContext<DB>) {
+    fn step(&mut self, interpreter: &mut Interpreter, ecx: Ecx) {
         self.pc = interpreter.program_counter();
 
         // `pauseGasMetering`: pause / resume interpreter gas.
@@ -1923,37 +1327,17 @@ impl<DB: DatabaseExt> Inspector<DB> for Cheatcodes {
         if let Some(mapping_slots) = &mut self.mapping_slots {
             mapping::step(mapping_slots, interpreter);
         }
+
+        // `snapshotGas*`: take a snapshot of the current gas.
+        if self.gas_metering.recording {
+            self.meter_gas_record(interpreter, ecx);
+        }
     }
 
     #[inline]
-    fn step_end(&mut self, interpreter: &mut Interpreter, ecx: &mut EvmContext<DB>) {
-        // override address(x).balance retrieval to make it consistent between EraVM and EVM
-        if self.use_zk_vm {
-            let address = match interpreter.current_opcode() {
-                op::SELFBALANCE => interpreter.contract().target_address,
-                op::BALANCE => {
-                    if interpreter.stack.is_empty() {
-                        interpreter.instruction_result = InstructionResult::StackUnderflow;
-                        return;
-                    }
-
-                    Address::from_word(B256::from(unsafe { interpreter.stack.pop_unsafe() }))
-                }
-                _ => return,
-            };
-
-            // Safety: Length is checked above.
-            let balance = foundry_zksync_core::balance(address, ecx);
-
-            // Skip the current BALANCE instruction since we've already handled it
-            match interpreter.stack.push(balance) {
-                Ok(_) => unsafe {
-                    interpreter.instruction_pointer = interpreter.instruction_pointer.add(1);
-                },
-                Err(e) => {
-                    interpreter.instruction_result = e;
-                }
-            }
+    fn step_end(&mut self, interpreter: &mut Interpreter, ecx: Ecx) {
+        if self.strategy.runner.pre_step_end(self.strategy.context.as_mut(), interpreter, ecx) {
+            return;
         }
 
         if self.gas_metering.paused {
@@ -1970,7 +1354,7 @@ impl<DB: DatabaseExt> Inspector<DB> for Cheatcodes {
         }
     }
 
-    fn log(&mut self, interpreter: &mut Interpreter, _ecx: &mut EvmContext<DB>, log: &Log) {
+    fn log(&mut self, interpreter: &mut Interpreter, _ecx: Ecx, log: &Log) {
         if !self.expected_emits.is_empty() {
             expect::handle_expect_emit(self, log, interpreter);
         }
@@ -1985,22 +1369,17 @@ impl<DB: DatabaseExt> Inspector<DB> for Cheatcodes {
         }
     }
 
-    fn call(&mut self, ecx: &mut EvmContext<DB>, inputs: &mut CallInputs) -> Option<CallOutcome> {
+    fn call(&mut self, ecx: Ecx, inputs: &mut CallInputs) -> Option<CallOutcome> {
         Self::call_with_executor(self, ecx, inputs, &mut TransparentCheatcodesExecutor)
     }
 
-    fn call_end(
-        &mut self,
-        ecx: &mut EvmContext<DB>,
-        call: &CallInputs,
-        mut outcome: CallOutcome,
-    ) -> CallOutcome {
+    fn call_end(&mut self, ecx: Ecx, call: &CallInputs, mut outcome: CallOutcome) -> CallOutcome {
         let ecx = &mut ecx.inner;
         let cheatcode_call = call.target_address == CHEATCODE_ADDRESS ||
             call.target_address == HARDHAT_CONSOLE_ADDRESS;
 
         // Clean up pranks/broadcasts if it's not a cheatcode call end. We shouldn't do
-        // it for cheatcode calls because they are not appplied for cheatcodes in the `call` hook.
+        // it for cheatcode calls because they are not applied for cheatcodes in the `call` hook.
         // This should be placed before the revert handling, because we might exit early there
         if !cheatcode_call {
             // Clean up pranks
@@ -2028,28 +1407,61 @@ impl<DB: DatabaseExt> Inspector<DB> for Cheatcodes {
             }
         }
 
-        // Handle assume not revert cheatcode.
-        if let Some(assume_no_revert) = &self.assume_no_revert {
-            if ecx.journaled_state.depth() == assume_no_revert.depth && !cheatcode_call {
-                // Discard run if we're at the same depth as cheatcode and call reverted.
+        // Handle assume no revert cheatcode.
+        if let Some(assume_no_revert) = &mut self.assume_no_revert {
+            // Record current reverter address before processing the expect revert if call reverted,
+            // expect revert is set with expected reverter address and no actual reverter set yet.
+            if outcome.result.is_revert() && assume_no_revert.reverted_by.is_none() {
+                assume_no_revert.reverted_by = Some(call.target_address);
+            }
+            // allow multiple cheatcode calls at the same depth
+            if ecx.journaled_state.depth() <= assume_no_revert.depth && !cheatcode_call {
+                // Discard run if we're at the same depth as cheatcode, call reverted, and no
+                // specific reason was supplied
                 if outcome.result.is_revert() {
-                    outcome.result.output = Error::from(MAGIC_ASSUME).abi_encode().into();
+                    let assume_no_revert = std::mem::take(&mut self.assume_no_revert).unwrap();
+                    return match revert_handlers::handle_assume_no_revert(
+                        &assume_no_revert,
+                        outcome.result.result,
+                        &outcome.result.output,
+                        &self.config.available_artifacts,
+                    ) {
+                        // if result is Ok, it was an anticipated revert; return an "assume" error
+                        // to reject this run
+                        Ok(_) => {
+                            outcome.result.output = Error::from(MAGIC_ASSUME).abi_encode().into();
+                            outcome
+                        }
+                        // if result is Error, it was an unanticipated revert; should revert
+                        // normally
+                        Err(error) => {
+                            trace!(expected=?assume_no_revert, ?error, status=?outcome.result.result, "Expected revert mismatch");
+                            outcome.result.result = InstructionResult::Revert;
+                            outcome.result.output = error.abi_encode().into();
+                            outcome
+                        }
+                    }
+                } else {
+                    // Call didn't revert, reset `assume_no_revert` state.
+                    self.assume_no_revert = None;
                     return outcome;
                 }
-                // Call didn't revert, reset `assume_no_revert` state.
-                self.assume_no_revert = None;
             }
         }
 
         // Handle expected reverts.
         if let Some(expected_revert) = &mut self.expected_revert {
-            // Record current reverter address before processing the expect revert if call reverted,
-            // expect revert is set with expected reverter address and no actual reverter set yet.
-            if outcome.result.is_revert() &&
-                expected_revert.reverter.is_some() &&
-                expected_revert.reverted_by.is_none()
-            {
-                expected_revert.reverted_by = Some(call.target_address);
+            // Record current reverter address and call scheme before processing the expect revert
+            // if call reverted.
+            if outcome.result.is_revert() {
+                // Record current reverter address if expect revert is set with expected reverter
+                // address and no actual reverter was set yet or if we're expecting more than one
+                // revert.
+                if expected_revert.reverter.is_some() &&
+                    (expected_revert.reverted_by.is_none() || expected_revert.count > 1)
+                {
+                    expected_revert.reverted_by = Some(call.target_address);
+                }
             }
 
             if ecx.journaled_state.depth() <= expected_revert.depth {
@@ -2063,10 +1475,11 @@ impl<DB: DatabaseExt> Inspector<DB> for Cheatcodes {
                 };
 
                 if needs_processing {
-                    let expected_revert = std::mem::take(&mut self.expected_revert).unwrap();
-                    return match expect::handle_expect_revert(
+                    let mut expected_revert = std::mem::take(&mut self.expected_revert).unwrap();
+                    return match revert_handlers::handle_expect_revert(
                         cheatcode_call,
                         false,
+                        self.config.internal_expect_revert,
                         &expected_revert,
                         outcome.result.result,
                         outcome.result.output.clone(),
@@ -2079,6 +1492,10 @@ impl<DB: DatabaseExt> Inspector<DB> for Cheatcodes {
                             outcome
                         }
                         Ok((_, retdata)) => {
+                            expected_revert.actual_count += 1;
+                            if expected_revert.actual_count < expected_revert.count {
+                                self.expected_revert = Some(expected_revert.clone());
+                            }
                             outcome.result.result = InstructionResult::Return;
                             outcome.result.output = retdata;
                             outcome
@@ -2166,21 +1583,63 @@ impl<DB: DatabaseExt> Inspector<DB> for Cheatcodes {
         let should_check_emits = self
             .expected_emits
             .iter()
-            .any(|expected| expected.depth == ecx.journaled_state.depth()) &&
+            .any(|(expected, _)| expected.depth == ecx.journaled_state.depth()) &&
             // Ignore staticcalls
             !call.is_static;
         if should_check_emits {
+            let expected_counts = self
+                .expected_emits
+                .iter()
+                .filter_map(|(expected, count_map)| {
+                    let count = match expected.address {
+                        Some(emitter) => match count_map.get(&emitter) {
+                            Some(log_count) => expected
+                                .log
+                                .as_ref()
+                                .map(|l| log_count.count(l))
+                                .unwrap_or_else(|| log_count.count_unchecked()),
+                            None => 0,
+                        },
+                        None => match &expected.log {
+                            Some(log) => count_map.values().map(|logs| logs.count(log)).sum(),
+                            None => count_map.values().map(|logs| logs.count_unchecked()).sum(),
+                        },
+                    };
+
+                    if count != expected.count {
+                        Some((expected, count))
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Vec<_>>();
+
             // Not all emits were matched.
-            if self.expected_emits.iter().any(|expected| !expected.found) {
+            if self.expected_emits.iter().any(|(expected, _)| !expected.found) {
                 outcome.result.result = InstructionResult::Revert;
                 outcome.result.output = "log != expected log".abi_encode().into();
                 return outcome;
-            } else {
-                // All emits were found, we're good.
-                // Clear the queue, as we expect the user to declare more events for the next call
-                // if they wanna match further events.
-                self.expected_emits.clear()
             }
+
+            if !expected_counts.is_empty() {
+                let msg = if outcome.result.is_ok() {
+                    let (expected, count) = expected_counts.first().unwrap();
+                    format!("log emitted {count} times, expected {}", expected.count)
+                } else {
+                    "expected an emit, but the call reverted instead. \
+                     ensure you're testing the happy path when using `expectEmit`"
+                        .to_string()
+                };
+
+                outcome.result.result = InstructionResult::Revert;
+                outcome.result.output = Error::encode(msg);
+                return outcome;
+            }
+
+            // All emits were found, we're good.
+            // Clear the queue, as we expect the user to declare more events for the next call
+            // if they wanna match further events.
+            self.expected_emits.clear()
         }
 
         // this will ensure we don't have false positives when trying to diagnose reverts in fork
@@ -2268,10 +1727,9 @@ impl<DB: DatabaseExt> Inspector<DB> for Cheatcodes {
                     }
                 }
             }
-
             // Check if we have any leftover expected emits
             // First, if any emits were found at the root call, then we its ok and we remove them.
-            self.expected_emits.retain(|expected| !expected.found);
+            self.expected_emits.retain(|(expected, _)| expected.count > 0 && !expected.found);
             // If not empty, we got mismatched emits
             if !self.expected_emits.is_empty() {
                 let msg = if outcome.result.is_ok() {
@@ -2290,34 +1748,26 @@ impl<DB: DatabaseExt> Inspector<DB> for Cheatcodes {
         outcome
     }
 
-    fn create(
-        &mut self,
-        ecx: &mut EvmContext<DB>,
-        call: &mut CreateInputs,
-    ) -> Option<CreateOutcome> {
+    fn create(&mut self, ecx: Ecx, call: &mut CreateInputs) -> Option<CreateOutcome> {
         self.create_common(ecx, call, &mut TransparentCheatcodesExecutor)
     }
 
     fn create_end(
         &mut self,
-        ecx: &mut EvmContext<DB>,
+        ecx: Ecx,
         _call: &CreateInputs,
         outcome: CreateOutcome,
     ) -> CreateOutcome {
         self.create_end_common(ecx, outcome)
     }
 
-    fn eofcreate(
-        &mut self,
-        ecx: &mut EvmContext<DB>,
-        call: &mut EOFCreateInputs,
-    ) -> Option<CreateOutcome> {
+    fn eofcreate(&mut self, ecx: Ecx, call: &mut EOFCreateInputs) -> Option<CreateOutcome> {
         self.create_common(ecx, call, &mut TransparentCheatcodesExecutor)
     }
 
     fn eofcreate_end(
         &mut self,
-        ecx: &mut EvmContext<DB>,
+        ecx: Ecx,
         _call: &EOFCreateInputs,
         outcome: CreateOutcome,
     ) -> CreateOutcome {
@@ -2325,12 +1775,8 @@ impl<DB: DatabaseExt> Inspector<DB> for Cheatcodes {
     }
 }
 
-impl<DB: DatabaseExt> InspectorExt<DB> for Cheatcodes {
-    fn should_use_create2_factory(
-        &mut self,
-        ecx: &mut EvmContext<DB>,
-        inputs: &mut CreateInputs,
-    ) -> bool {
+impl InspectorExt for Cheatcodes {
+    fn should_use_create2_factory(&mut self, ecx: Ecx, inputs: &mut CreateInputs) -> bool {
         if let CreateScheme::Create2 { .. } = inputs.scheme {
             let target_depth = if let Some(prank) = &self.prank {
                 prank.depth
@@ -2346,6 +1792,10 @@ impl<DB: DatabaseExt> InspectorExt<DB> for Cheatcodes {
             false
         }
     }
+
+    fn create2_deployer(&self) -> Address {
+        self.config.evm_opts.create2_deployer
+    }
 }
 
 impl Cheatcodes {
@@ -2357,6 +1807,27 @@ impl Cheatcodes {
         } else {
             // Record frame paused gas.
             self.gas_metering.paused_frames.push(interpreter.gas);
+        }
+    }
+
+    #[cold]
+    fn meter_gas_record(&mut self, interpreter: &mut Interpreter, ecx: Ecx) {
+        if matches!(interpreter.instruction_result, InstructionResult::Continue) {
+            self.gas_metering.gas_records.iter_mut().for_each(|record| {
+                if ecx.journaled_state.depth() == record.depth {
+                    // Skip the first opcode of the first call frame as it includes the gas cost of
+                    // creating the snapshot.
+                    if self.gas_metering.last_gas_used != 0 {
+                        let gas_diff =
+                            interpreter.gas.spent().saturating_sub(self.gas_metering.last_gas_used);
+                        record.gas_used = record.gas_used.saturating_add(gas_diff);
+                    }
+
+                    // Update `last_gas_used` to the current spent gas for the next iteration to
+                    // compare against.
+                    self.gas_metering.last_gas_used = interpreter.gas.spent();
+                }
+            });
         }
     }
 
@@ -2396,11 +1867,7 @@ impl Cheatcodes {
     ///   cache) from mapped source address to the target address.
     /// - generates arbitrary value and saves it in target address storage.
     #[cold]
-    fn arbitrary_storage_end<DB: DatabaseExt>(
-        &mut self,
-        interpreter: &mut Interpreter,
-        ecx: &mut EvmContext<DB>,
-    ) {
+    fn arbitrary_storage_end(&mut self, interpreter: &mut Interpreter, ecx: Ecx) {
         let (key, target_address) = if interpreter.current_opcode() == op::SLOAD {
             (try_or_return!(interpreter.stack().peek(0)), interpreter.contract().target_address)
         } else {
@@ -2450,11 +1917,7 @@ impl Cheatcodes {
     }
 
     #[cold]
-    fn record_state_diffs<DB: DatabaseExt>(
-        &mut self,
-        interpreter: &mut Interpreter,
-        ecx: &mut EvmContext<DB>,
-    ) {
+    fn record_state_diffs(&mut self, interpreter: &mut Interpreter, ecx: Ecx) {
         let Some(account_accesses) = &mut self.recorded_account_diffs_stack else { return };
         match interpreter.current_opcode() {
             op::SELFDESTRUCT => {
@@ -2801,10 +2264,7 @@ fn disallowed_mem_write(
 
 // Determines if the gas limit on a given call was manually set in the script and should therefore
 // not be overwritten by later estimations
-fn check_if_fixed_gas_limit<DB: DatabaseExt>(
-    ecx: &InnerEvmContext<DB>,
-    call_gas_limit: u64,
-) -> bool {
+pub fn check_if_fixed_gas_limit(ecx: InnerEcx, call_gas_limit: u64) -> bool {
     // If the gas limit was not set in the source code it is set to the estimated gas left at the
     // time of the call, which should be rather close to configured gas limit.
     // TODO: Find a way to reliably make this determination.
@@ -2874,59 +2334,27 @@ fn append_storage_access(
 }
 
 /// Dispatches the cheatcode call to the appropriate function.
-fn apply_dispatch<DB: DatabaseExt, E: CheatcodesExecutor>(
+fn apply_dispatch(
     calls: &Vm::VmCalls,
-    ccx: &mut CheatsCtxt<DB>,
-    executor: &mut E,
+    ccx: &mut CheatsCtxt,
+    executor: &mut dyn CheatcodesExecutor,
 ) -> Result {
-    macro_rules! dispatch {
-        ($($variant:ident),*) => {
-            match calls {
-                $(Vm::VmCalls::$variant(cheat) => crate::Cheatcode::apply_full(cheat, ccx, executor),)*
-            }
-        };
+    let cheat = calls_as_dyn_cheatcode(calls);
+
+    let _guard = debug_span!(target: "cheatcodes", "apply", id = %cheat.id()).entered();
+    trace!(target: "cheatcodes", cheat = ?cheat.as_debug(), "applying");
+
+    if let spec::Status::Deprecated(replacement) = *cheat.status() {
+        ccx.state.deprecated.insert(cheat.signature(), replacement);
     }
 
-    let mut dyn_cheat = DynCheatCache::new(calls);
-    let _guard = trace_span_and_call(&mut dyn_cheat);
-    let mut result = vm_calls!(dispatch);
-    fill_and_trace_return(&mut dyn_cheat, &mut result);
-    result
-}
+    // Apply the cheatcode.
+    let mut result = ccx.state.strategy.runner.apply_full(cheat, ccx, executor);
 
-/// Helper function to check if frame execution will exit.
-fn will_exit(ir: InstructionResult) -> bool {
-    !matches!(ir, InstructionResult::Continue | InstructionResult::CallOrCreate)
-}
-
-// Caches the result of `calls_as_dyn_cheatcode`.
-// TODO: Remove this once Cheatcode is object-safe, as caching would not be necessary anymore.
-struct DynCheatCache<'a> {
-    calls: &'a Vm::VmCalls,
-    slot: Option<&'a dyn DynCheatcode>,
-}
-
-impl<'a> DynCheatCache<'a> {
-    fn new(calls: &'a Vm::VmCalls) -> Self {
-        Self { calls, slot: None }
-    }
-
-    fn get(&mut self) -> &dyn DynCheatcode {
-        *self.slot.get_or_insert_with(|| calls_as_dyn_cheatcode(self.calls))
-    }
-}
-
-fn trace_span_and_call(dyn_cheat: &mut DynCheatCache) -> tracing::span::EnteredSpan {
-    let span = debug_span!(target: "cheatcodes", "apply", id = %dyn_cheat.get().id());
-    let entered = span.entered();
-    trace!(target: "cheatcodes", cheat = ?dyn_cheat.get().as_debug(), "applying");
-    entered
-}
-
-fn fill_and_trace_return(dyn_cheat: &mut DynCheatCache, result: &mut Result) {
-    if let Err(e) = result {
+    // Format the error message to include the cheatcode name.
+    if let Err(e) = &mut result {
         if e.is_str() {
-            let name = dyn_cheat.get().name();
+            let name = cheat.name();
             // Skip showing the cheatcode name for:
             // - assertions: too verbose, and can already be inferred from the error message
             // - `rpcUrl`: forge-std relies on it in `getChainWithUpdatedRpcUrl`
@@ -2935,16 +2363,18 @@ fn fill_and_trace_return(dyn_cheat: &mut DynCheatCache, result: &mut Result) {
             }
         }
     }
+
     trace!(
         target: "cheatcodes",
-        return = %match result {
+        return = %match &result {
             Ok(b) => hex::encode(b),
             Err(e) => e.to_string(),
         }
     );
+
+    result
 }
 
-#[cold]
 fn calls_as_dyn_cheatcode(calls: &Vm::VmCalls) -> &dyn DynCheatcode {
     macro_rules! as_dyn {
         ($($variant:ident),*) => {
@@ -2954,4 +2384,9 @@ fn calls_as_dyn_cheatcode(calls: &Vm::VmCalls) -> &dyn DynCheatcode {
         };
     }
     vm_calls!(as_dyn)
+}
+
+/// Helper function to check if frame execution will exit.
+fn will_exit(ir: InstructionResult) -> bool {
+    !matches!(ir, InstructionResult::Continue | InstructionResult::CallOrCreate)
 }

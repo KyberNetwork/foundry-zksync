@@ -1,12 +1,12 @@
-use crate::executors::{Executor, RawCallResult};
+use crate::executors::{Executor, FuzzTestTimer, RawCallResult};
 use alloy_dyn_abi::JsonAbiExt;
 use alloy_json_abi::Function;
-use alloy_primitives::{Address, Bytes, Log, U256};
+use alloy_primitives::{map::HashMap, Address, Bytes, Log, U256};
 use eyre::Result;
 use foundry_common::evm::Breakpoints;
 use foundry_config::FuzzConfig;
 use foundry_evm_core::{
-    constants::MAGIC_ASSUME,
+    constants::{MAGIC_ASSUME, TEST_TIMEOUT},
     decode::{RevertDecoder, SkipReason},
 };
 use foundry_evm_coverage::HitMaps;
@@ -17,7 +17,7 @@ use foundry_evm_fuzz::{
 use foundry_evm_traces::SparsedTraceArena;
 use indicatif::ProgressBar;
 use proptest::test_runner::{TestCaseError, TestError, TestRunner};
-use std::cell::RefCell;
+use std::{cell::RefCell, collections::BTreeMap};
 
 mod types;
 pub use types::{CaseOutcome, CounterExampleOutcome, FuzzOutcome};
@@ -39,6 +39,10 @@ pub struct FuzzTestData {
     pub coverage: Option<HitMaps>,
     // Stores logs for all fuzz cases
     pub logs: Vec<Log>,
+    // Stores gas snapshots for all fuzz cases
+    pub gas_snapshots: BTreeMap<String, BTreeMap<String, String>>,
+    // Deprecated cheatcodes mapped to their replacements.
+    pub deprecated_cheatcodes: HashMap<&'static str, Option<&'static str>>,
 }
 
 /// Wrapper around an [`Executor`] which provides fuzzing support using [`proptest`].
@@ -73,10 +77,12 @@ impl FuzzedExecutor {
     /// test case.
     ///
     /// Returns a list of all the consumed gas and calldata of every fuzz case
+    #[allow(clippy::too_many_arguments)]
     pub fn fuzz(
         &self,
         func: &Function,
         fuzz_fixtures: &FuzzFixtures,
+        deployed_libs: &[Address],
         address: Address,
         should_fail: bool,
         rd: &RevertDecoder,
@@ -84,10 +90,10 @@ impl FuzzedExecutor {
     ) -> FuzzTestResult {
         // Stores the fuzz test execution data.
         let execution_data = RefCell::new(FuzzTestData::default());
-        let state = self.build_fuzz_state();
+        let state = self.build_fuzz_state(deployed_libs);
         let no_zksync_reserved_addresses = state.dictionary_read().no_zksync_reserved_addresses();
         let dictionary_weight = self.config.dictionary.dictionary_weight.min(100);
-        let strat = proptest::prop_oneof![
+        let strategy = proptest::prop_oneof![
             100 - dictionary_weight => fuzz_calldata(func.clone(), fuzz_fixtures, no_zksync_reserved_addresses),
             dictionary_weight => fuzz_calldata_from_state(func.clone(), &state),
         ];
@@ -95,7 +101,15 @@ impl FuzzedExecutor {
         let max_traces_to_collect = std::cmp::max(1, self.config.gas_report_samples) as usize;
         let show_logs = self.config.show_logs;
 
-        let run_result = self.runner.clone().run(&strat, |calldata| {
+        // Start timer for this fuzz test.
+        let timer = FuzzTestTimer::new(self.config.timeout);
+
+        let run_result = self.runner.clone().run(&strategy, |calldata| {
+            // Check if the timeout has been reached.
+            if timer.is_timed_out() {
+                return Err(TestCaseError::fail(TEST_TIMEOUT));
+            }
+
             let fuzz_res = self.single_fuzz(address, should_fail, calldata)?;
 
             // If running with progress then increment current run.
@@ -107,9 +121,11 @@ impl FuzzedExecutor {
                 FuzzOutcome::Case(case) => {
                     let mut data = execution_data.borrow_mut();
                     data.gas_by_case.push((case.case.gas, case.case.stipend));
+
                     if data.first_case.is_none() {
                         data.first_case.replace(case.case);
                     }
+
                     if let Some(call_traces) = case.traces {
                         if data.traces.len() == max_traces_to_collect {
                             data.traces.pop();
@@ -117,14 +133,14 @@ impl FuzzedExecutor {
                         data.traces.push(call_traces);
                         data.breakpoints.replace(case.breakpoints);
                     }
+
                     if show_logs {
                         data.logs.extend(case.logs);
                     }
-                    // Collect and merge coverage if `forge snapshot` context.
-                    match &mut data.coverage {
-                        Some(prev) => prev.merge(case.coverage.unwrap()),
-                        opt => *opt = case.coverage,
-                    }
+
+                    HitMaps::merge_opt(&mut data.coverage, case.coverage);
+
+                    data.deprecated_cheatcodes = case.deprecated_cheatcodes;
 
                     Ok(())
                 }
@@ -169,6 +185,7 @@ impl FuzzedExecutor {
             breakpoints: last_run_breakpoints,
             gas_report_traces: traces.into_iter().map(|a| a.arena).collect(),
             coverage: fuzz_result.coverage,
+            deprecated_cheatcodes: fuzz_result.deprecated_cheatcodes,
         };
 
         match run_result {
@@ -187,17 +204,21 @@ impl FuzzedExecutor {
             }
             Err(TestError::Fail(reason, _)) => {
                 let reason = reason.to_string();
-                result.reason = (!reason.is_empty()).then_some(reason);
-
-                let args = if let Some(data) = calldata.get(4..) {
-                    func.abi_decode_input(data, false).unwrap_or_default()
+                if reason == TEST_TIMEOUT {
+                    // If the reason is a timeout, we consider the fuzz test successful.
+                    result.success = true;
                 } else {
-                    vec![]
-                };
+                    result.reason = (!reason.is_empty()).then_some(reason);
+                    let args = if let Some(data) = calldata.get(4..) {
+                        func.abi_decode_input(data, false).unwrap_or_default()
+                    } else {
+                        vec![]
+                    };
 
-                result.counterexample = Some(CounterExample::Single(
-                    BaseCounterExample::from_fuzz_call(calldata, args, call.traces),
-                ));
+                    result.counterexample = Some(CounterExample::Single(
+                        BaseCounterExample::from_fuzz_call(calldata, args, call.traces),
+                    ));
+                }
             }
         }
 
@@ -231,10 +252,10 @@ impl FuzzedExecutor {
             return Err(TestCaseError::reject(FuzzError::AssumeReject))
         }
 
-        let breakpoints = call
-            .cheatcodes
-            .as_ref()
-            .map_or_else(Default::default, |cheats| cheats.breakpoints.clone());
+        let (breakpoints, deprecated_cheatcodes) =
+            call.cheatcodes.as_ref().map_or_else(Default::default, |cheats| {
+                (cheats.breakpoints.clone(), cheats.deprecated.clone())
+            });
 
         let success = self.executor.is_raw_call_mut_success(address, &mut call, should_fail);
         if success {
@@ -244,6 +265,7 @@ impl FuzzedExecutor {
                 coverage: call.coverage,
                 breakpoints,
                 logs: call.logs,
+                deprecated_cheatcodes,
             }))
         } else {
             Ok(FuzzOutcome::CounterExample(CounterExampleOutcome {
@@ -255,17 +277,19 @@ impl FuzzedExecutor {
     }
 
     /// Stores fuzz state for use with [fuzz_calldata_from_state]
-    pub fn build_fuzz_state(&self) -> EvmFuzzState {
+    pub fn build_fuzz_state(&self, deployed_libs: &[Address]) -> EvmFuzzState {
         if let Some(fork_db) = self.executor.backend.active_fork_db() {
             EvmFuzzState::new(
                 fork_db,
                 self.config.dictionary,
+                deployed_libs,
                 self.config.no_zksync_reserved_addresses,
             )
         } else {
             EvmFuzzState::new(
                 self.executor.backend.mem_db(),
                 self.config.dictionary,
+                deployed_libs,
                 self.config.no_zksync_reserved_addresses,
             )
         }

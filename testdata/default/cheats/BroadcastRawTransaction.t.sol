@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
-pragma solidity 0.8.18;
+pragma solidity ^0.8.18;
 
 import "ds-test/test.sol";
 import "cheats/Vm.sol";
@@ -117,8 +117,8 @@ contract BroadcastRawTransactionTest is DSTest {
         assertEq(address(from).balance, balance - (gasPrice * 21_000) - amountSent);
         assertEq(address(to).balance, amountSent);
 
-        vm.expectRevert();
-        assert(3 == 4);
+        vm._expectCheatcodeRevert();
+        vm.assertFalse(true);
     }
 
     function test_execute_multiple_signed_tx() public {

@@ -1,7 +1,7 @@
 use super::ZksyncSourceProvider;
 use crate::zk_provider::ZkVerificationContext;
 use eyre::{Context, Result};
-use foundry_compilers::zksolc::input::StandardJsonCompilerInput;
+use foundry_zksync_compilers::compilers::zksolc::input::StandardJsonCompilerInput;
 
 #[derive(Debug)]
 pub struct ZksyncStandardJsonSource;
@@ -11,11 +11,14 @@ impl ZksyncSourceProvider for ZksyncStandardJsonSource {
         &self,
         context: &ZkVerificationContext,
     ) -> Result<(StandardJsonCompilerInput, String)> {
-        let input = foundry_compilers::zksync::project_standard_json_input(
+        let mut input = foundry_zksync_compilers::compilers::project_standard_json_input(
             &context.project,
             &context.target_path,
         )
         .wrap_err("failed to get zksolc standard json")?;
+
+        // Sanitize the input
+        input.settings = input.settings.clone().sanitized(&context.compiler_version.solc);
 
         let relative_path = context
             .target_path

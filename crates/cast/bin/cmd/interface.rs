@@ -3,10 +3,10 @@ use alloy_primitives::Address;
 use clap::Parser;
 use eyre::{Context, Result};
 use foundry_block_explorers::Client;
-use foundry_cli::opts::EtherscanOpts;
-use foundry_common::{compile::ProjectCompiler, fs};
+use foundry_cli::{opts::EtherscanOpts, utils::LoadConfig};
+use foundry_common::{compile::ProjectCompiler, fs, shell};
 use foundry_compilers::{info::ContractInfo, utils::canonicalize};
-use foundry_config::{load_config_with_root, try_find_project_root, Config};
+use foundry_config::load_config;
 use itertools::Itertools;
 use serde_json::Value;
 use std::{
@@ -44,17 +44,13 @@ pub struct InterfaceArgs {
     )]
     output: Option<PathBuf>,
 
-    /// If specified, the interface will be output as JSON rather than Solidity.
-    #[arg(long, short)]
-    json: bool,
-
     #[command(flatten)]
     etherscan: EtherscanOpts,
 }
 
 impl InterfaceArgs {
     pub async fn run(self) -> Result<()> {
-        let Self { contract, name, pragma, output: output_location, etherscan, json } = self;
+        let Self { contract, name, pragma, output: output_location, etherscan } = self;
 
         // Determine if the target contract is an ABI file, a local contract or an Ethereum address.
         let abis = if Path::new(&contract).is_file() &&
@@ -75,7 +71,7 @@ impl InterfaceArgs {
         let interfaces = get_interfaces(abis)?;
 
         // Print result or write to file.
-        let res = if json {
+        let res = if shell::is_json() {
             // Format as JSON.
             interfaces.iter().map(|iface| &iface.json_abi).format("\n").to_string()
         } else {
@@ -93,9 +89,9 @@ impl InterfaceArgs {
                 fs::create_dir_all(parent)?;
             }
             fs::write(&loc, res)?;
-            println!("Saved interface at {}", loc.display());
+            sh_println!("Saved interface at {}", loc.display())?;
         } else {
-            print!("{res}");
+            sh_print!("{res}")?;
         }
 
         Ok(())
@@ -108,7 +104,7 @@ struct InterfaceSource {
 }
 
 /// Load the ABI from a file.
-fn load_abi_from_file(path: &str, name: Option<String>) -> Result<Vec<(JsonAbi, String)>> {
+pub fn load_abi_from_file(path: &str, name: Option<String>) -> Result<Vec<(JsonAbi, String)>> {
     let file = std::fs::read_to_string(path).wrap_err("unable to read abi file")?;
     let obj: ContractObject = serde_json::from_str(&file)?;
     let abi = obj.abi.ok_or_else(|| eyre::eyre!("could not find ABI in file {path}"))?;
@@ -118,8 +114,7 @@ fn load_abi_from_file(path: &str, name: Option<String>) -> Result<Vec<(JsonAbi, 
 
 /// Load the ABI from the artifact of a locally compiled contract.
 fn load_abi_from_artifact(path_or_contract: &str) -> Result<Vec<(JsonAbi, String)>> {
-    let root = try_find_project_root(None)?;
-    let config = load_config_with_root(Some(&root));
+    let config = load_config()?;
     let project = config.project()?;
     let compiler = ProjectCompiler::new().quiet(true);
 
@@ -139,11 +134,11 @@ fn load_abi_from_artifact(path_or_contract: &str) -> Result<Vec<(JsonAbi, String
 }
 
 /// Fetches the ABI of a contract from Etherscan.
-async fn fetch_abi_from_etherscan(
+pub async fn fetch_abi_from_etherscan(
     address: Address,
     etherscan: &EtherscanOpts,
 ) -> Result<Vec<(JsonAbi, String)>> {
-    let config = Config::from(etherscan);
+    let config = etherscan.load_config()?;
     let chain = config.chain.unwrap_or_default();
     let api_key = config.get_etherscan_api_key(Some(chain)).unwrap_or_default();
     let client = Client::new(chain, api_key)?;

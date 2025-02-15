@@ -13,11 +13,10 @@ use zksync_types::{
     ACCOUNT_CODE_STORAGE_ADDRESS, CURRENT_VIRTUAL_BLOCK_INFO_POSITION, KNOWN_CODES_STORAGE_ADDRESS,
     L2_BASE_TOKEN_ADDRESS, NONCE_HOLDER_ADDRESS, SYSTEM_CONTEXT_ADDRESS,
 };
-use zksync_utils::bytecode::hash_bytecode;
 
 use crate::{
     convert::{ConvertAddress, ConvertH160, ConvertH256, ConvertRU256, ConvertU256},
-    EMPTY_CODE,
+    hash_bytecode, EMPTY_CODE,
 };
 
 /// Sets `block.timestamp`.
@@ -86,15 +85,7 @@ where
     <DB as Database>::Error: Debug,
 {
     info!(?address, ?nonce, "cheatcode setNonce");
-    //ensure nonce is _only_ tx nonce
-    let (tx_nonce, _deploy_nonce) = decompose_full_nonce(nonce.to_u256());
-
-    let nonce_addr = NONCE_HOLDER_ADDRESS.to_address();
-    ecx.load_account(nonce_addr).expect("account could not be loaded");
-    let zk_address = address.to_h160();
-    let nonce_key = get_nonce_key(&zk_address).key().to_ru256();
-    ecx.touch(&nonce_addr);
-    ecx.sstore(nonce_addr, nonce_key, tx_nonce.to_ru256()).expect("failed storing value");
+    crate::set_tx_nonce(address, nonce, ecx);
 }
 
 /// Gets nonce for a specific address.
@@ -113,6 +104,22 @@ where
 
     let (tx_nonce, _deploy_nonce) = decompose_full_nonce(full_nonce.to_u256());
     tx_nonce.to_ru256()
+}
+
+/// Gets the full nonce for a specific address.
+pub fn get_full_nonce<DB>(address: Address, ecx: &mut InnerEvmContext<DB>) -> (rU256, rU256)
+where
+    DB: Database,
+    <DB as Database>::Error: Debug,
+{
+    let nonce_addr = NONCE_HOLDER_ADDRESS.to_address();
+    ecx.load_account(nonce_addr).expect("account could not be loaded");
+    let zk_address = address.to_h160();
+    let nonce_key = get_nonce_key(&zk_address).key().to_ru256();
+    let full_nonce = ecx.sload(nonce_addr, nonce_key).unwrap_or_default();
+
+    let (tx_nonce, deploy_nonce) = decompose_full_nonce(full_nonce.to_u256());
+    (tx_nonce.to_ru256(), deploy_nonce.to_ru256())
 }
 
 /// Sets code for a specific address.
@@ -175,7 +182,7 @@ where
             .expect("account 'KNOWN_CODES_STORAGE_ADDRESS' could not be loaded");
     }
 
-    let empty_code_hash = zksync_utils::bytecode::hash_bytecode(&EMPTY_CODE);
+    let empty_code_hash = hash_bytecode(&EMPTY_CODE);
 
     // update account code storage for empty code
     let account_key = address.to_h256().to_ru256();

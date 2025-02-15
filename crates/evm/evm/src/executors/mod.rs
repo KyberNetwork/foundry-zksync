@@ -11,7 +11,10 @@ use crate::inspectors::{
 };
 use alloy_dyn_abi::{DynSolValue, FunctionExt, JsonAbiExt};
 use alloy_json_abi::Function;
-use alloy_primitives::{Address, Bytes, Log, U256};
+use alloy_primitives::{
+    map::{AddressHashMap, HashMap},
+    Address, Bytes, Log, U256,
+};
 use alloy_sol_types::{sol, SolCall};
 use foundry_evm_core::{
     backend::{Backend, BackendError, BackendResult, CowBackend, DatabaseExt, GLOBAL_FAIL_SLOT},
@@ -21,20 +24,23 @@ use foundry_evm_core::{
     },
     decode::{RevertDecoder, SkipReason},
     utils::StateChangeset,
+    InspectorExt,
 };
 use foundry_evm_coverage::HitMaps;
 use foundry_evm_traces::{SparsedTraceArena, TraceMode};
-use foundry_zksync_core::ZkTransactionMetadata;
 use revm::{
     db::{DatabaseCommit, DatabaseRef},
     interpreter::{return_ok, InstructionResult},
     primitives::{
-        BlockEnv, Bytecode, Env, EnvWithHandlerCfg, ExecutionResult, Output, ResultAndState,
-        SpecId, TxEnv, TxKind,
+        AuthorizationList, BlockEnv, Bytecode, Env, EnvWithHandlerCfg, ExecutionResult, Output,
+        ResultAndState, SignedAuthorization, SpecId, TxEnv, TxKind,
     },
-    Database,
 };
-use std::{borrow::Cow, collections::HashMap};
+use std::{
+    borrow::Cow,
+    time::{Duration, Instant},
+};
+use strategy::{DeployLibKind, DeployLibResult, ExecutorStrategy};
 
 mod builder;
 pub use builder::ExecutorBuilder;
@@ -47,6 +53,8 @@ pub use invariant::InvariantExecutor;
 
 mod trace;
 pub use trace::TracingExecutor;
+
+pub mod strategy;
 
 sol! {
     interface ITest {
@@ -69,7 +77,7 @@ sol! {
 /// - `deploy`: a special case of `transact`, specialized for persisting the state of a contract
 ///   deployment
 /// - `setup`: a special case of `transact`, used to set up the environment for a test
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct Executor {
     /// The underlying `revm::Database` that contains the EVM storage.
     // Note: We do not store an EVM here, since we are really
@@ -81,19 +89,25 @@ pub struct Executor {
     pub env: EnvWithHandlerCfg,
     /// The Revm inspector stack.
     pub inspector: InspectorStack,
-    /// The gas limit for calls and deployments. This is different from the gas limit imposed by
-    /// the passed in environment, as those limits are used by the EVM for certain opcodes like
-    /// `gaslimit`.
+    /// The gas limit for calls and deployments.
     gas_limit: u64,
     /// Whether `failed()` should be called on the test contract to determine if the test failed.
     legacy_assertions: bool,
 
-    /// Sets up the next transaction to be executed as a ZK transaction.
-    zk_tx: Option<ZkTransactionMetadata>,
-    // simulate persisted factory deps
-    zk_persisted_factory_deps: HashMap<foundry_zksync_core::H256, Vec<u8>>,
+    pub strategy: ExecutorStrategy,
+}
 
-    pub use_zk: bool,
+impl Clone for Executor {
+    fn clone(&self) -> Self {
+        Self {
+            backend: self.backend.clone(),
+            env: self.env.clone(),
+            inspector: self.inspector.clone(),
+            gas_limit: self.gas_limit,
+            legacy_assertions: self.legacy_assertions,
+            strategy: self.strategy.clone(),
+        }
+    }
 }
 
 impl Executor {
@@ -111,6 +125,7 @@ impl Executor {
         inspector: InspectorStack,
         gas_limit: u64,
         legacy_assertions: bool,
+        strategy: ExecutorStrategy,
     ) -> Self {
         // Need to create a non-empty contract on the cheatcodes address so `extcodesize` checks
         // do not fail.
@@ -125,21 +140,19 @@ impl Executor {
             },
         );
 
-        Self {
-            backend,
-            env,
-            inspector,
-            gas_limit,
-            legacy_assertions,
-            zk_tx: None,
-            zk_persisted_factory_deps: Default::default(),
-            use_zk: false,
-        }
+        Self { backend, env, inspector, gas_limit, legacy_assertions, strategy }
     }
 
     fn clone_with_backend(&self, backend: Backend) -> Self {
         let env = EnvWithHandlerCfg::new_with_spec_id(Box::new(self.env().clone()), self.spec_id());
-        Self::new(backend, env, self.inspector().clone(), self.gas_limit, self.legacy_assertions)
+        Self::new(
+            backend,
+            env,
+            self.inspector().clone(),
+            self.gas_limit,
+            self.legacy_assertions,
+            self.strategy.clone(),
+        )
     }
 
     /// Returns a reference to the EVM backend.
@@ -177,6 +190,36 @@ impl Executor {
         self.env.spec_id()
     }
 
+    /// Sets the EVM spec ID.
+    pub fn set_spec_id(&mut self, spec_id: SpecId) {
+        self.env.handler_cfg.spec_id = spec_id;
+    }
+
+    /// Returns the gas limit for calls and deployments.
+    ///
+    /// This is different from the gas limit imposed by the passed in environment, as those limits
+    /// are used by the EVM for certain opcodes like `gaslimit`.
+    pub fn gas_limit(&self) -> u64 {
+        self.gas_limit
+    }
+
+    /// Sets the gas limit for calls and deployments.
+    pub fn set_gas_limit(&mut self, gas_limit: u64) {
+        self.gas_limit = gas_limit;
+    }
+
+    /// Returns whether `failed()` should be called on the test contract to determine if the test
+    /// failed.
+    pub fn legacy_assertions(&self) -> bool {
+        self.legacy_assertions
+    }
+
+    /// Sets whether `failed()` should be called on the test contract to determine if the test
+    /// failed.
+    pub fn set_legacy_assertions(&mut self, legacy_assertions: bool) {
+        self.legacy_assertions = legacy_assertions;
+    }
+
     /// Creates the default CREATE2 Contract Deployer for local tests and scripts.
     pub fn deploy_create2_deployer(&mut self) -> eyre::Result<()> {
         trace!("deploying local create2 deployer");
@@ -186,7 +229,7 @@ impl Executor {
             .ok_or_else(|| BackendError::MissingAccount(DEFAULT_CREATE2_DEPLOYER))?;
 
         // If the deployer is not currently deployed, deploy the default one.
-        if create2_deployer_account.code.map_or(true, |code| code.is_empty()) {
+        if create2_deployer_account.code.is_none_or(|code| code.is_empty()) {
             let creator = DEFAULT_CREATE2_DEPLOYER_DEPLOYER;
 
             // Probably 0, but just in case.
@@ -204,16 +247,8 @@ impl Executor {
 
     /// Set the balance of an account.
     pub fn set_balance(&mut self, address: Address, amount: U256) -> BackendResult<()> {
-        trace!(?address, ?amount, "setting account balance ZK={}", self.use_zk);
-        let mut account = self.backend().basic_ref(address)?.unwrap_or_default();
-        account.balance = amount;
-        self.backend_mut().insert_account_info(address, account);
-
-        if self.use_zk {
-            let (address, slot) = foundry_zksync_core::state::get_balance_storage(address);
-            self.backend.insert_account_storage(address, slot, amount)?;
-        }
-        Ok(())
+        trace!(?address, ?amount, "setting account balance");
+        self.strategy.runner.set_balance(self, address, amount)
     }
 
     /// Gets the balance of an account
@@ -223,19 +258,7 @@ impl Executor {
 
     /// Set the nonce of an account.
     pub fn set_nonce(&mut self, address: Address, nonce: u64) -> BackendResult<()> {
-        let mut account = self.backend().basic_ref(address)?.unwrap_or_default();
-        account.nonce = nonce;
-        self.backend_mut().insert_account_info(address, account);
-        if self.use_zk {
-            let (address, slot) = foundry_zksync_core::state::get_nonce_storage(address);
-            // fetch the full nonce to preserve account's deployment nonce
-            let full_nonce = self.backend.storage(address, slot)?;
-            let full_nonce = foundry_zksync_core::state::parse_full_nonce(full_nonce);
-            let new_full_nonce =
-                foundry_zksync_core::state::new_full_nonce(nonce, full_nonce.deploy_nonce);
-            self.backend.insert_account_storage(address, slot, new_full_nonce)?;
-        }
-        Ok(())
+        self.strategy.runner.set_nonce(self, address, nonce)
     }
 
     /// Returns the nonce of an account.
@@ -261,9 +284,8 @@ impl Executor {
     }
 
     #[inline]
-    pub fn set_gas_limit(&mut self, gas_limit: u64) -> &mut Self {
-        self.gas_limit = gas_limit;
-        self
+    pub fn create2_deployer(&self) -> Address {
+        self.inspector().create2_deployer()
     }
 
     /// Deploys a contract and commits the new state to the underlying database.
@@ -279,6 +301,23 @@ impl Executor {
     ) -> Result<DeployResult, EvmError> {
         let env = self.build_test_env(from, TxKind::Create, code, value);
         self.deploy_with_env(env, rd)
+    }
+
+    /// Deploys a library contract and commits the new state to the underlying database.
+    ///
+    /// Executes a `deploy_kind` transaction with the provided parameters
+    /// and persistent database state modifications.
+    ///
+    /// Will return a list of deployment results and transaction requests
+    /// Will also ensure nonce is increased for the sender
+    pub fn deploy_library(
+        &mut self,
+        from: Address,
+        kind: DeployLibKind,
+        value: U256,
+        rd: Option<&RevertDecoder>,
+    ) -> Result<Vec<DeployLibResult>, EvmError> {
+        self.strategy.runner.deploy_library(self, from, kind, value, rd)
     }
 
     /// Deploys a contract using the given `env` and commits the new state to the underlying
@@ -407,6 +446,21 @@ impl Executor {
         self.call_with_env(env)
     }
 
+    /// Performs a raw call to an account on the current state of the VM with an EIP-7702
+    /// authorization list.
+    pub fn call_raw_with_authorization(
+        &mut self,
+        from: Address,
+        to: Address,
+        calldata: Bytes,
+        value: U256,
+        authorization_list: Vec<SignedAuthorization>,
+    ) -> eyre::Result<RawCallResult> {
+        let mut env = self.build_test_env(from, to.into(), calldata, value);
+        env.tx.authorization_list = Some(AuthorizationList::Signed(authorization_list));
+        self.call_with_env(env)
+    }
+
     /// Performs a raw call to an account on the current state of the VM.
     pub fn transact_raw(
         &mut self,
@@ -426,21 +480,21 @@ impl Executor {
     pub fn call_with_env(&self, mut env: EnvWithHandlerCfg) -> eyre::Result<RawCallResult> {
         let mut inspector = self.inspector().clone();
         let mut backend = CowBackend::new_borrowed(self.backend());
-        let result = match &self.zk_tx {
-            None => backend.inspect(&mut env, &mut inspector)?,
-            Some(zk_tx) => {
-                // apply fork-related env instead of cheatcode handler
-                // since it won't be run inside zkvm
-                env.block = self.env.block.clone();
-                env.tx.gas_price = self.env.tx.gas_price;
-                backend.inspect_ref_zk(
-                    &mut env,
-                    &mut self.zk_persisted_factory_deps.clone(),
-                    Some(zk_tx.factory_deps.clone()),
-                )?
-            }
-        };
-        convert_executed_result(env, inspector, result, backend.has_snapshot_failure())
+
+        let result = self.strategy.runner.call(
+            self.strategy.context.as_ref(),
+            &mut backend,
+            &mut env,
+            &self.env,
+            &mut inspector,
+        )?;
+
+        convert_executed_result(
+            env.clone(),
+            inspector,
+            result,
+            backend.has_state_snapshot_failure(),
+        )
     }
 
     /// Execute the transaction configured in `env.tx`.
@@ -448,39 +502,21 @@ impl Executor {
     pub fn transact_with_env(&mut self, mut env: EnvWithHandlerCfg) -> eyre::Result<RawCallResult> {
         let mut inspector = self.inspector.clone();
         let backend = &mut self.backend;
-        let result_and_state = match self.zk_tx.take() {
-            None => backend.inspect(&mut env, &mut inspector)?,
-            Some(zk_tx) => {
-                // apply fork-related env instead of cheatcode handler
-                // since it won't be run inside zkvm
-                env.block = self.env.block.clone();
-                env.tx.gas_price = self.env.tx.gas_price;
-                backend.inspect_ref_zk(
-                    &mut env,
-                    // this will persist the added factory deps,
-                    // no need to commit them later
-                    &mut self.zk_persisted_factory_deps,
-                    Some(zk_tx.factory_deps),
-                )?
-            }
-        };
-        let mut result = convert_executed_result(
-            env,
-            inspector,
-            result_and_state.clone(),
-            backend.has_snapshot_failure(),
+
+        let result_and_state = self.strategy.runner.transact(
+            self.strategy.context.as_mut(),
+            backend,
+            &mut env,
+            &self.env,
+            &mut inspector,
         )?;
-        let state = result_and_state.state;
-        if let Some(traces) = &mut result.traces {
-            for trace_node in traces.nodes() {
-                if let Some(account_info) = state.get(&trace_node.trace.address) {
-                    result.deployments.insert(
-                        trace_node.trace.address,
-                        account_info.info.code.clone().unwrap_or_default().bytes(),
-                    );
-                }
-            }
-        }
+
+        let mut result = convert_executed_result(
+            env.clone(),
+            inspector,
+            result_and_state,
+            backend.has_state_snapshot_failure(),
+        )?;
 
         self.commit(&mut result);
         Ok(result)
@@ -541,7 +577,7 @@ impl Executor {
         call_result: &RawCallResult,
         should_fail: bool,
     ) -> bool {
-        if call_result.has_snapshot_failure {
+        if call_result.has_state_snapshot_failure {
             // a failure occurred in a reverted snapshot, which is considered a failed test
             return should_fail;
         }
@@ -593,7 +629,7 @@ impl Executor {
         }
 
         // A failure occurred in a reverted snapshot, which is considered a failed test.
-        if self.backend().has_snapshot_failure() {
+        if self.backend().has_state_snapshot_failure() {
             return false;
         }
 
@@ -649,14 +685,10 @@ impl Executor {
         }
     }
 
-    pub fn setup_zk_tx(&mut self, zk_tx: ZkTransactionMetadata) {
-        self.zk_tx = Some(zk_tx);
-    }
-
     /// Creates the environment to use when executing a transaction in a test context
     ///
     /// If using a backend with cheatcodes, `tx.gas_price` and `block.number` will be overwritten by
-    /// the cheatcode state inbetween calls.
+    /// the cheatcode state in between calls.
     fn build_test_env(
         &self,
         caller: Address,
@@ -736,11 +768,15 @@ pub enum EvmError {
     #[error(transparent)]
     Abi(#[from] alloy_dyn_abi::Error),
     /// Error caused which occurred due to calling the `skip` cheatcode.
-    #[error("{_0}")]
+    #[error("{0}")]
     Skip(SkipReason),
     /// Any other error.
-    #[error(transparent)]
-    Eyre(#[from] eyre::Error),
+    #[error("{0}")]
+    Eyre(
+        #[from]
+        #[source]
+        eyre::Report,
+    ),
 }
 
 impl From<ExecutionErr> for EvmError {
@@ -780,6 +816,12 @@ impl std::ops::DerefMut for DeployResult {
     }
 }
 
+impl From<DeployResult> for RawCallResult {
+    fn from(d: DeployResult) -> Self {
+        d.raw
+    }
+}
+
 /// The result of a raw call.
 #[derive(Debug)]
 pub struct RawCallResult {
@@ -791,7 +833,7 @@ pub struct RawCallResult {
     ///
     /// This is tracked separately from revert because a snapshot failure can occur without a
     /// revert, since assert failures are stored in a global variable (ds-test legacy)
-    pub has_snapshot_failure: bool,
+    pub has_state_snapshot_failure: bool,
     /// The raw result of the call.
     pub result: Bytes,
     /// The gas used for the call
@@ -803,7 +845,7 @@ pub struct RawCallResult {
     /// The logs emitted during the call
     pub logs: Vec<Log>,
     /// The labels assigned to addresses during the call
-    pub labels: HashMap<Address, String>,
+    pub labels: AddressHashMap<String>,
     /// The traces of the call
     pub traces: Option<SparsedTraceArena>,
     /// The coverage info collected during the call
@@ -820,23 +862,20 @@ pub struct RawCallResult {
     pub out: Option<Output>,
     /// The chisel state
     pub chisel_state: Option<(Vec<U256>, Vec<u8>, InstructionResult)>,
-    /// The deployments generated during the call
-    pub deployments: HashMap<Address, Bytes>,
 }
 
 impl Default for RawCallResult {
     fn default() -> Self {
         Self {
-            deployments: HashMap::new(),
             exit_reason: InstructionResult::Continue,
             reverted: false,
-            has_snapshot_failure: false,
+            has_state_snapshot_failure: false,
             result: Bytes::new(),
             gas_used: 0,
             gas_refunded: 0,
             stipend: 0,
             logs: Vec::new(),
-            labels: HashMap::new(),
+            labels: HashMap::default(),
             traces: None,
             coverage: None,
             transactions: None,
@@ -850,6 +889,23 @@ impl Default for RawCallResult {
 }
 
 impl RawCallResult {
+    /// Unpacks an EVM result.
+    pub fn from_evm_result(r: Result<Self, EvmError>) -> eyre::Result<(Self, Option<String>)> {
+        match r {
+            Ok(r) => Ok((r, None)),
+            Err(EvmError::Execution(e)) => Ok((e.raw, Some(e.reason))),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Unpacks an execution result.
+    pub fn from_execution_result(r: Result<Self, ExecutionErr>) -> (Self, Option<String>) {
+        match r {
+            Ok(r) => (r, None),
+            Err(e) => (e.raw, Some(e.reason)),
+        }
+    }
+
     /// Converts the result of the call into an `EvmError`.
     pub fn into_evm_error(self, rd: Option<&RevertDecoder>) -> EvmError {
         if let Some(reason) = SkipReason::decode(&self.result) {
@@ -925,7 +981,7 @@ fn convert_executed_result(
     env: EnvWithHandlerCfg,
     inspector: InspectorStack,
     ResultAndState { result, state: state_changeset }: ResultAndState,
-    has_snapshot_failure: bool,
+    has_state_snapshot_failure: bool,
 ) -> eyre::Result<RawCallResult> {
     let (exit_reason, gas_refunded, gas_used, out, _exec_logs) = match result {
         ExecutionResult::Success { reason, gas_used, gas_refunded, output, logs, .. } => {
@@ -939,7 +995,7 @@ fn convert_executed_result(
             (reason.into(), 0_u64, gas_used, None, vec![])
         }
     };
-    let stipend = revm::interpreter::gas::validate_initial_tx_gas(
+    let gas = revm::interpreter::gas::calculate_initial_tx_gas(
         env.spec_id(),
         &env.tx.data,
         env.tx.transact_to.is_create(),
@@ -961,14 +1017,13 @@ fn convert_executed_result(
         .filter(|txs| !txs.is_empty());
 
     Ok(RawCallResult {
-        deployments: HashMap::new(),
         exit_reason,
         reverted: !matches!(exit_reason, return_ok!()),
-        has_snapshot_failure,
+        has_state_snapshot_failure,
         result,
         gas_used,
         gas_refunded,
-        stipend,
+        stipend: gas.initial_gas,
         logs,
         labels,
         traces,
@@ -980,4 +1035,21 @@ fn convert_executed_result(
         out,
         chisel_state,
     })
+}
+
+/// Timer for a fuzz test.
+pub struct FuzzTestTimer {
+    /// Inner fuzz test timer - (test start time, test duration).
+    inner: Option<(Instant, Duration)>,
+}
+
+impl FuzzTestTimer {
+    pub fn new(timeout: Option<u32>) -> Self {
+        Self { inner: timeout.map(|timeout| (Instant::now(), Duration::from_secs(timeout.into()))) }
+    }
+
+    /// Whether the current fuzz test timed out and should be stopped.
+    pub fn is_timed_out(&self) -> bool {
+        self.inner.is_some_and(|(start, duration)| start.elapsed() > duration)
+    }
 }

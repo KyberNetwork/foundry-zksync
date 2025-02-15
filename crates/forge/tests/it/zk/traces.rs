@@ -8,16 +8,16 @@ use forge::{
     revm::primitives::SpecId,
     traces::{CallKind, CallTraceNode, SparsedTraceArena, TraceKind},
 };
-use foundry_common::fs;
+use foundry_common::{fs, sh_println};
 use foundry_test_utils::Filter;
 use itertools::Itertools;
 use serde::Deserialize;
 
 const ADDRESS_ZK_TRACE_TEST: Address = address!("7fa9385be102ac3eac297483dd6233d62b3e1496");
-const ADDRESS_ADDER: Address = address!("f9e9ba9ed9b96ab918c74b21dd0f1d5f2ac38a30");
-const ADDRESS_NUMBER: Address = address!("f232f12e115391c535fd519b00efadf042fc8be5");
-const ADDRESS_FIRST_INNER_NUMBER: Address = address!("ed570f3f91621894e001df0fb70bfbd123d3c8ad");
-const ADDRESS_SECOND_INNER_NUMBER: Address = address!("abceaeac3d3a2ac3dcffd7a60ca00a3fac9490ca");
+const ADDRESS_ADDER: Address = address!("b5c1df089600415b21fb76bf89900adb575947c8");
+const ADDRESS_NUMBER: Address = address!("d6a7a38ee698efae2f48f3a62dc7a71c3c0930a1");
+const ADDRESS_FIRST_INNER_NUMBER: Address = address!("89c74b24fb24dda42a8465ee0f9ede2c1308deeb");
+const ADDRESS_SECOND_INNER_NUMBER: Address = address!("9359008843d2c083a14e9c17cde01893938047fa");
 const ADDRESS_CONSOLE: Address = address!("000000000000000000636f6e736f6c652e6c6f67");
 const SELECTOR_TEST_CALL: Bytes = Bytes::from_static(hex!("0d3282c4").as_slice());
 const SELECTOR_TEST_CREATE: Bytes = Bytes::from_static(hex!("61bdc916").as_slice());
@@ -31,8 +31,8 @@ const VALUE_TEN: Bytes = Bytes::from_static(
     hex!("000000000000000000000000000000000000000000000000000000000000000a").as_slice(),
 );
 const VALUE_LOG_UINT_TEN: Bytes = Bytes::from_static(
-    hex!("f5b1bba9000000000000000000000000000000000000000000000000000000000000000a").as_slice(),
-); // selector: log(uint)
+    hex!("f82c50f1000000000000000000000000000000000000000000000000000000000000000a").as_slice(),
+); // selector: log(uint256)
 
 static BYTECODE_ADDER: LazyLock<Vec<u8>> =
     LazyLock::new(|| get_zk_artifact_bytecode("Trace.t.sol/Adder.json"));
@@ -63,10 +63,12 @@ fn get_zk_artifact_bytecode<P: AsRef<Path> + std::fmt::Debug>(path: P) -> Vec<u8
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_zk_traces_work_during_call() {
-    let runner = TEST_DATA_DEFAULT.runner_zksync();
+    let mut zk_config = TEST_DATA_DEFAULT.zk_test_data.zk_config.clone();
+    zk_config.verbosity = 5;
+    let runner = TEST_DATA_DEFAULT.runner_with_zksync_config(zk_config);
     let filter = Filter::new("testZkTraceOutputDuringCall", "ZkTraceTest", ".*");
 
-    let results = TestConfig::with_filter(runner, filter).evm_spec(SpecId::SHANGHAI).test();
+    let results = TestConfig::with_filter(runner, filter).spec_id(SpecId::SHANGHAI).test();
     let traces =
         &results["zk/Trace.t.sol:ZkTraceTest"].test_results["testZkTraceOutputDuringCall()"].traces;
 
@@ -157,10 +159,12 @@ async fn test_zk_traces_work_during_call() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_zk_traces_work_during_create() {
-    let runner = TEST_DATA_DEFAULT.runner_zksync();
+    let mut zk_config = TEST_DATA_DEFAULT.zk_test_data.zk_config.clone();
+    zk_config.verbosity = 5;
+    let runner = TEST_DATA_DEFAULT.runner_with_zksync_config(zk_config);
     let filter = Filter::new("testZkTraceOutputDuringCreate", "ZkTraceTest", ".*");
 
-    let results = TestConfig::with_filter(runner, filter).evm_spec(SpecId::SHANGHAI).test();
+    let results = TestConfig::with_filter(runner, filter).spec_id(SpecId::SHANGHAI).test();
     let traces = results["zk/Trace.t.sol:ZkTraceTest"].test_results
         ["testZkTraceOutputDuringCreate()"]
         .traces
@@ -335,14 +339,14 @@ fn assert_execution_trace(
 
     let actual = decode_first_execution_trace(traces);
     if let Some(failure) = assert_recursive(&expected, &actual) {
-        println!("---");
-        println!("{failure:#?}");
-        println!("---");
-        println!("Trace:");
+        let _ = sh_println!("---");
+        let _ = sh_println!("{failure:#?}");
+        let _ = sh_println!("---");
+        let _ = sh_println!("Trace:");
         let mut actual = &actual;
         for (depth, idx) in failure.path.iter().enumerate() {
             let trace = &actual[*idx];
-            println!(
+            let _ = sh_println!(
                 "{}{:?} {:?} {:?} {:?}",
                 "  ".repeat(depth),
                 trace.kind,
@@ -353,7 +357,7 @@ fn assert_execution_trace(
 
             actual = &trace.children;
         }
-        println!("---\n");
+        let _ = sh_println!("---\n");
         panic!("trace assertion failure");
     }
 }

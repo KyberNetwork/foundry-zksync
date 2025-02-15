@@ -5,10 +5,9 @@ use clap::Parser;
 use eyre::Result;
 use foundry_cli::{
     opts::{EthereumOpts, TransactionOpts},
-    utils,
+    utils::{self, LoadConfig},
 };
 use foundry_common::ens::NameOrAddress;
-use foundry_config::Config;
 use std::str::FromStr;
 
 /// CLI arguments for `cast access-list`.
@@ -35,10 +34,6 @@ pub struct AccessListArgs {
     #[arg(long, short = 'B')]
     block: Option<BlockId>,
 
-    /// Print the access list as JSON.
-    #[arg(long, short, help_heading = "Display options")]
-    json: bool,
-
     #[command(flatten)]
     tx: TransactionOpts,
 
@@ -48,9 +43,9 @@ pub struct AccessListArgs {
 
 impl AccessListArgs {
     pub async fn run(self) -> Result<()> {
-        let Self { to, sig, args, tx, eth, block, json: to_json } = self;
+        let Self { to, sig, args, tx, eth, block } = self;
 
-        let config = Config::from(&eth);
+        let config = eth.load_config()?;
         let provider = utils::get_provider(&config)?;
         let sender = SenderKind::from_wallet_opts(eth.wallet).await?;
 
@@ -65,9 +60,9 @@ impl AccessListArgs {
 
         let cast = Cast::new(&provider);
 
-        let access_list: String = cast.access_list(&tx, block, to_json).await?;
+        let access_list: String = cast.access_list(&tx, block).await?;
 
-        println!("{access_list}");
+        sh_println!("{access_list}")?;
 
         Ok(())
     }

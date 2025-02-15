@@ -6,10 +6,15 @@
 #![cfg_attr(docsrs, feature(doc_cfg, doc_auto_cfg))]
 
 #[macro_use]
+extern crate foundry_common;
+
+#[macro_use]
 extern crate tracing;
 
-use alloy_primitives::{Address, Bytes};
-use foundry_common::contracts::{ContractsByAddress, ContractsByArtifact};
+use foundry_common::{
+    contracts::{ContractsByAddress, ContractsByArtifact},
+    shell,
+};
 use revm::interpreter::OpCode;
 use revm_inspectors::tracing::{
     types::{DecodedTraceStep, TraceMemberOrder},
@@ -18,9 +23,11 @@ use revm_inspectors::tracing::{
 use serde::{Deserialize, Serialize};
 use std::{
     borrow::Cow,
-    collections::{BTreeSet, HashMap},
+    collections::BTreeSet,
     ops::{Deref, DerefMut},
 };
+
+use alloy_primitives::map::HashMap;
 
 pub use revm_inspectors::tracing::{
     types::{
@@ -179,9 +186,35 @@ pub async fn decode_trace_arena(
 
 /// Render a collection of call traces to a string.
 pub fn render_trace_arena(arena: &SparsedTraceArena) -> String {
-    let mut w = TraceWriter::new(Vec::<u8>::new());
+    render_trace_arena_inner(arena, false, false)
+}
+
+/// Render a collection of call traces to a string optionally including contract creation bytecodes
+/// and in JSON format.
+pub fn render_trace_arena_inner(
+    arena: &SparsedTraceArena,
+    with_bytecodes: bool,
+    with_storage_changes: bool,
+) -> String {
+    if shell::is_json() {
+        return serde_json::to_string(&arena.resolve_arena()).expect("Failed to write traces");
+    }
+
+    let mut w = TraceWriter::new(Vec::<u8>::new())
+        .color_cheatcodes(true)
+        .use_colors(convert_color_choice(shell::color_choice()))
+        .write_bytecodes(with_bytecodes)
+        .with_storage_changes(with_storage_changes);
     w.write_arena(&arena.resolve_arena()).expect("Failed to write traces");
     String::from_utf8(w.into_writer()).expect("trace writer wrote invalid UTF-8")
+}
+
+fn convert_color_choice(choice: shell::ColorChoice) -> revm_inspectors::ColorChoice {
+    match choice {
+        shell::ColorChoice::Auto => revm_inspectors::ColorChoice::Auto,
+        shell::ColorChoice::Always => revm_inspectors::ColorChoice::Always,
+        shell::ColorChoice::Never => revm_inspectors::ColorChoice::Never,
+    }
 }
 
 /// Specifies the kind of trace.
@@ -222,10 +255,8 @@ impl TraceKind {
 pub fn load_contracts<'a>(
     traces: impl IntoIterator<Item = &'a CallTraceArena>,
     known_contracts: &ContractsByArtifact,
-    deployments: &HashMap<Address, Bytes>,
 ) -> ContractsByAddress {
     let mut local_identifier = LocalTraceIdentifier::new(known_contracts);
-    local_identifier.deployments.clone_from(deployments);
     let decoder = CallTraceDecoder::new();
     let mut contracts = ContractsByAddress::new();
     for trace in traces {
@@ -279,6 +310,8 @@ pub enum TraceMode {
     ///
     /// Used by debugger.
     Debug,
+    /// Debug trace with storage changes.
+    RecordStateDiff,
 }
 
 impl TraceMode {
@@ -298,6 +331,10 @@ impl TraceMode {
         matches!(self, Self::Jump)
     }
 
+    pub const fn record_state_diff(self) -> bool {
+        matches!(self, Self::RecordStateDiff)
+    }
+
     pub const fn is_debug(self) -> bool {
         matches!(self, Self::Debug)
     }
@@ -314,8 +351,16 @@ impl TraceMode {
         std::cmp::max(self, mode.into())
     }
 
-    pub fn with_verbosity(self, verbosiy: u8) -> Self {
-        if verbosiy >= 3 {
+    pub fn with_state_changes(self, yes: bool) -> Self {
+        if yes {
+            std::cmp::max(self, Self::RecordStateDiff)
+        } else {
+            self
+        }
+    }
+
+    pub fn with_verbosity(self, verbosity: u8) -> Self {
+        if verbosity >= 3 {
             std::cmp::max(self, Self::Call)
         } else {
             self
@@ -335,7 +380,7 @@ impl TraceMode {
                     StackSnapshotType::None
                 },
                 record_logs: true,
-                record_state_diff: false,
+                record_state_diff: self.record_state_diff(),
                 record_returndata_snapshots: self.is_debug(),
                 record_opcodes_filter: (self.is_jump() || self.is_jump_simple())
                     .then(|| OpcodeFilter::new().enabled(OpCode::JUMP).enabled(OpCode::JUMPDEST)),

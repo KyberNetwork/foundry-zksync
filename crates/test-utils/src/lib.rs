@@ -4,6 +4,10 @@
 
 #![cfg_attr(not(test), warn(unused_crate_dependencies))]
 #![cfg_attr(docsrs, feature(doc_cfg, doc_auto_cfg))]
+#![allow(clippy::disallowed_macros)]
+
+#[macro_use]
+extern crate foundry_common;
 
 #[macro_use]
 extern crate tracing;
@@ -27,7 +31,7 @@ pub use script::{ScriptOutcome, ScriptTester};
 
 // TODO: remove once anvil supports zksync node
 mod zksync;
-pub use zksync::ZkSyncNode;
+pub use zksync::{Fork, ZkSyncNode};
 
 // re-exports for convenience
 pub use foundry_compilers;
