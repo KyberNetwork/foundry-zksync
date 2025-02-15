@@ -87,9 +87,9 @@ main() {
 
     for bin in "${BINS[@]}"; do
       # Remove prior installations if they exist
-      rm -f "$FOUNDRY_BIN_DIR/$bin"
+      rm -f "$FOUNDRY_BIN_DIR/$bin-zksync"
       # Symlink from local repo binaries to bin dir
-      ensure ln -s "$PWD/target/release/$bin" "$FOUNDRY_BIN_DIR/$bin"
+      ensure ln -s "$PWD/target/release/$bin" "$FOUNDRY_BIN_DIR/$bin-zksync"
     done
 
     say "done"
@@ -169,7 +169,7 @@ main() {
     MAN_TARBALL_URL="${RELEASE_URL}foundry_zksync_man_${MAN_TAG}.tar.gz"
     
     # Download and extract the binaries archive
-    say "downloading latest forge, and cast"
+    say "downloading latest forge-zksync, and cast-zksync"
     if [ "$PLATFORM" = "win32" ]; then
       tmp="$(mktemp -d 2>/dev/null || echo ".")/foundry-zksync.zip"
       ensure download "$BIN_ARCHIVE_URL" "$tmp"
@@ -190,7 +190,7 @@ main() {
     fi
 
     for bin in "${BINS[@]}"; do
-      bin_path="$FOUNDRY_BIN_DIR/$bin"
+      bin_path="$FOUNDRY_BIN_DIR/$bin-zksync"
       cp $FOUNDRY_VERSIONS_DIR/$ARCHIVE_TAG/$bin $bin_path
 
       # Print installed msg
@@ -331,16 +331,12 @@ EOF
     # If help2man is installed, use it to add Foundry man pages.
     if check_cmd help2man; then
       for bin in "${BINS[@]}"; do
-        help2man -N "$FOUNDRY_BIN_DIR/$bin" > "$FOUNDRY_MAN_DIR/$bin.1"
+        help2man -N "$FOUNDRY_BIN_DIR/$bin-zksync" > "$FOUNDRY_MAN_DIR/$bin-zksync.1"
       done
     fi
 
     say "done"
   fi
-
-  for bin in "${BINS[@]}"; do
-    mv "$FOUNDRY_BIN_DIR/$bin" "$FOUNDRY_BIN_DIR/$bin-zksync"
-  done
 }
 
 usage() {
@@ -404,7 +400,7 @@ list() {
     done
   else
     for bin in "${BINS[@]}"; do
-      bin_path="$FOUNDRY_BIN_DIR/$bin"
+      bin_path="$FOUNDRY_BIN_DIR/$bin-zksync"
       say "- $(ensure "$bin_path" -V)"
     done
   fi
@@ -419,7 +415,7 @@ use() {
     check_bins_in_use
 
     for bin in "${BINS[@]}"; do
-      bin_path="$FOUNDRY_BIN_DIR/$bin"
+      bin_path="$FOUNDRY_BIN_DIR/$bin-zksync"
       cp $FOUNDRY_VERSION_DIR/$bin $bin_path
       # Print usage msg
       say "use - $(ensure "$bin_path" -V)"

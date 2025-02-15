@@ -23,7 +23,7 @@ echo "Running the installation script..."
 # Extract the exact path from the install.log
 # Use sed to precisely capture the path after 'source' and before the next apostrophe
 SHELL_CONFIG_FILE=$(sed -n "s/.*Run 'source \(.*\)'.*/\1/p" install.log)
-FOUNDRY_BIN_DIR="${XDG_CONFIG_HOME:-$HOME}/.foundry/bin"
+FOUNDRY_BIN_DIR="${XDG_CONFIG_HOME:-$HOME}/.foundry-zksync/bin"
 
 if [ -n "$SHELL_CONFIG_FILE" ]; then
     if [ -n "${CI}" ]; then
@@ -62,7 +62,7 @@ echo "Cleanup completed."
 echo "Installation completed successfully!"
 
 echo "Verifying installation..."
-FORGE_VERSION_OUTPUT=$("${FOUNDRY_BIN_DIR}/forge-zskync" --version 2>/dev/null || true)
+FORGE_VERSION_OUTPUT=$("${FOUNDRY_BIN_DIR}/forge-zksync" --version 2>/dev/null || true)
 
 echo $FORGE_VERSION_OUTPUT
 
