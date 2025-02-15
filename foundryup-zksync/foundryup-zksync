@@ -197,7 +197,7 @@ main() {
       say "installed - $(ensure "$bin_path" --version)"
 
       # Check if the default path of the binary is not in FOUNDRY_BIN_DIR
-      which_path="$(command -v "$bin" || true)"
+      which_path="$(command -v "$bin-zksync" || true)"
       if [ -n "$which_path" ] && [ "$which_path" != "$bin_path" ]; then
         warn ""
         cat 1>&2 <<EOF
@@ -421,7 +421,7 @@ use() {
       say "use - $(ensure "$bin_path" -V)"
 
       # Check if the default path of the binary is not in FOUNDRY_BIN_DIR
-      which_path="$(command -v "$bin" || true)"
+      which_path="$(command -v "$bin-zksync" || true)"
       if [ -n "$which_path" ] && [ "$which_path" != "$bin_path" ]; then
         warn ""
         cat 1>&2 <<EOF
