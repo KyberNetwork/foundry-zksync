@@ -33,7 +33,9 @@ use std::os::unix::fs::PermissionsExt;
 
 pub mod input;
 pub mod settings;
+mod types;
 pub use settings::{ZkSettings, ZkSolcSettings};
+pub use types::{ErrorType, WarningType};
 
 /// ZKsync solc release used for all ZKsync solc versions
 pub const ZKSYNC_SOLC_RELEASE: Version = Version::new(1, 0, 1);
@@ -365,7 +367,7 @@ impl ZkSolc {
                     if name.ends_with(".yul") {
                         let sanitized_name = name
                             .split('/')
-                            .last()
+                            .next_back()
                             .and_then(|name| name.strip_suffix(".yul"))
                             .expect("Error sanitizing path into name");
                         // Removing and inserting should be fine because there cannot be
@@ -410,7 +412,7 @@ impl ZkSolc {
     /// Get supported zksolc versions
     pub fn zksolc_supported_versions() -> Vec<Version> {
         let mut ret = vec![];
-        let version_ranges = vec![(1, 5, 6..=11)];
+        let version_ranges = vec![(1, 5, 6..=12)];
 
         for (major, minor, patch_range) in version_ranges {
             for patch in patch_range {
@@ -438,7 +440,7 @@ impl ZkSolc {
     pub fn solc_available_versions() -> Vec<Version> {
         let mut ret = vec![];
         let version_ranges =
-            vec![(0, 4, 12..=26), (0, 5, 0..=17), (0, 6, 0..=12), (0, 7, 0..=6), (0, 8, 0..=28)];
+            vec![(0, 4, 12..=26), (0, 5, 0..=17), (0, 6, 0..=12), (0, 7, 0..=6), (0, 8, 0..=29)];
         for (major, minor, patch_range) in version_ranges {
             for patch in patch_range {
                 ret.push(Version::new(major, minor, patch));
@@ -616,7 +618,7 @@ fn version_from_output(output: Output) -> Result<Version> {
         let version = stdout
             .lines()
             .filter(|l| !l.trim().is_empty())
-            .last()
+            .next_back()
             .ok_or_else(|| SolcError::msg("Version not found in zksolc output"))?;
 
         version

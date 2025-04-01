@@ -3,7 +3,6 @@ use alloy_network::AnyNetwork;
 use alloy_primitives::{Address, B256, U256};
 use alloy_provider::Provider;
 use alloy_rpc_types::BlockId;
-use alloy_transport::Transport;
 use cast::Cast;
 use clap::Parser;
 use comfy_table::{modifiers::UTF8_ROUND_CORNERS, Cell, Table};
@@ -51,6 +50,10 @@ pub struct StorageArgs {
     /// The storage slot number. If not provided, it gets the full storage layout.
     #[arg(value_parser = parse_slot)]
     slot: Option<B256>,
+
+    /// The known proxy address. If provided, the storage layout is retrieved from this address.
+    #[arg(long,value_parser = NameOrAddress::from_str)]
+    proxy: Option<NameOrAddress>,
 
     /// The block height to query at.
     ///
@@ -135,7 +138,11 @@ impl StorageArgs {
         let chain = utils::get_chain(config.chain, &provider).await?;
         let api_key = config.get_etherscan_api_key(Some(chain)).unwrap_or_default();
         let client = Client::new(chain, api_key)?;
-        let source = find_source(client, address).await?;
+        let source = if let Some(proxy) = self.proxy {
+            find_source(client, proxy.resolve(&provider).await?).await?
+        } else {
+            find_source(client, address).await?
+        };
         let metadata = source.items.first().unwrap();
         if metadata.is_vyper() {
             eyre::bail!("Contract at provided address is not a valid Solidity contract")
@@ -229,7 +236,7 @@ struct StorageReport {
     values: Vec<B256>,
 }
 
-async fn fetch_and_print_storage<P: Provider<T, AnyNetwork>, T: Transport + Clone>(
+async fn fetch_and_print_storage<P: Provider<AnyNetwork>>(
     provider: P,
     address: Address,
     block: Option<BlockId>,
@@ -246,7 +253,7 @@ async fn fetch_and_print_storage<P: Provider<T, AnyNetwork>, T: Transport + Clon
     }
 }
 
-async fn fetch_storage_slots<P: Provider<T, AnyNetwork>, T: Transport + Clone>(
+async fn fetch_storage_slots<P: Provider<AnyNetwork>>(
     provider: P,
     address: Address,
     block: Option<BlockId>,

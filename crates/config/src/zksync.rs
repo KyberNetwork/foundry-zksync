@@ -1,4 +1,3 @@
-use era_solc::standard_json::input::settings::{error_type::ErrorType, warning_type::WarningType};
 use foundry_compilers::{
     artifacts::{EvmVersion, Libraries, Severity},
     error::SolcError,
@@ -15,13 +14,13 @@ use foundry_zksync_compilers::{
                 BytecodeHash, Codegen, Optimizer, OptimizerDetails, SettingsMetadata,
                 ZkSolcSettings,
             },
-            ZkSettings, ZkSolc, ZkSolcCompiler,
+            ErrorType, WarningType, ZkSettings, ZkSolc, ZkSolcCompiler,
         },
     },
 };
 use semver::Version;
-use serde::{Deserialize, Serialize};
-use std::{collections::HashSet, path::PathBuf};
+use serde::{Deserialize, Deserializer, Serialize};
+use std::{collections::HashSet, path::PathBuf, str::FromStr};
 
 use crate::{Config, SkipBuildFilters, SolcReq};
 
@@ -54,7 +53,7 @@ pub struct ZkSyncConfig {
     pub bytecode_hash: Option<BytecodeHash>,
 
     /// Whether to try to recompile with -Oz if the bytecode is too large.
-    pub fallback_oz: bool,
+    pub size_fallback: bool,
 
     /// Whether to support compilation of zkSync-specific simulations
     pub enable_eravm_extensions: bool,
@@ -62,6 +61,7 @@ pub struct ZkSyncConfig {
     /// Force evmla for zkSync
     pub force_evmla: bool,
 
+    #[serde(alias = "LLVMOptions")]
     pub llvm_options: Vec<String>,
 
     /// Enable optimizer for zkSync
@@ -74,9 +74,11 @@ pub struct ZkSyncConfig {
     pub optimizer_details: Option<OptimizerDetails>,
 
     // zksolc suppressed warnings.
+    #[serde(deserialize_with = "deserialize_warning_set")]
     pub suppressed_warnings: HashSet<WarningType>,
 
     // zksolc suppressed errors.
+    #[serde(deserialize_with = "deserialize_error_set")]
     pub suppressed_errors: HashSet<ErrorType>,
 }
 
@@ -89,7 +91,7 @@ impl Default for ZkSyncConfig {
             solc_path: Default::default(),
             hash_type: Default::default(),
             bytecode_hash: Default::default(),
-            fallback_oz: Default::default(),
+            size_fallback: Default::default(),
             enable_eravm_extensions: Default::default(),
             force_evmla: Default::default(),
             llvm_options: Default::default(),
@@ -124,7 +126,8 @@ impl ZkSyncConfig {
         let optimizer = Optimizer {
             enabled: Some(self.optimizer),
             mode: Some(self.optimizer_mode),
-            fallback_to_optimizing_for_size: Some(self.fallback_oz),
+            size_fallback: Some(self.size_fallback),
+            fallback_to_optimizing_for_size: None,
             disable_system_request_memoization: Some(true),
             details: self.optimizer_details.clone(),
             jump_table_density_threshold: None,
@@ -134,13 +137,14 @@ impl ZkSyncConfig {
             libraries,
             optimizer,
             evm_version: Some(evm_version),
-            metadata: Some(SettingsMetadata::new(self.hash_type.or(self.bytecode_hash))),
+            metadata: Some(SettingsMetadata::new(self.hash_type())),
             via_ir: Some(via_ir),
             // Set in project paths.
             remappings: Vec::new(),
             enable_eravm_extensions: self.enable_eravm_extensions,
             force_evmla: self.force_evmla,
             llvm_options: self.llvm_options.clone(),
+            llvm_options_legacy: Default::default(),
             output_selection: OutputSelection {
                 all: FileOutputSelection {
                     per_file: [].into(),
@@ -155,7 +159,7 @@ impl ZkSyncConfig {
         let zksolc_path = if let Some(path) = config_ensure_zksolc(self.zksolc.as_ref(), offline)? {
             path
         } else if !offline {
-            let default_version = semver::Version::new(1, 5, 11);
+            let default_version = ZkSolc::zksolc_latest_supported_version();
             let mut zksolc = ZkSolc::find_installed_version(&default_version)?;
             if zksolc.is_none() {
                 ZkSolc::blocking_install(&default_version)?;
@@ -168,6 +172,10 @@ impl ZkSyncConfig {
 
         // `cli_settings` get set from `Project` values when building `ZkSolcVersionedInput`
         ZkSolcSettings::new_from_path(settings, CliSettings::default(), zksolc_path)
+    }
+
+    pub fn hash_type(&self) -> Option<BytecodeHash> {
+        self.hash_type.or(self.bytecode_hash)
     }
 }
 
@@ -332,6 +340,40 @@ pub fn config_ensure_zksolc(
     }
 
     Ok(None)
+}
+
+fn deserialize_warning_set<'de, D>(deserializer: D) -> Result<HashSet<WarningType>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let strings: Vec<String> = Vec::deserialize(deserializer)?;
+    Ok(strings
+        .into_iter()
+        .filter_map(|s| match WarningType::from_str(&s) {
+            Ok(warning) => Some(warning),
+            Err(e) => {
+                error!("Failed to parse warning type: '{}' with error: {}", s, e);
+                None
+            }
+        })
+        .collect())
+}
+
+fn deserialize_error_set<'de, D>(deserializer: D) -> Result<HashSet<ErrorType>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let strings: Vec<String> = Vec::deserialize(deserializer)?;
+    Ok(strings
+        .into_iter()
+        .filter_map(|s| match ErrorType::from_str(&s) {
+            Ok(error) => Some(error),
+            Err(e) => {
+                error!("Failed to parse error type: '{}' with error: {}", s, e);
+                None
+            }
+        })
+        .collect())
 }
 
 #[cfg(test)]

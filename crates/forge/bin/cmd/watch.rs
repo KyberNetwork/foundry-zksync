@@ -1,6 +1,6 @@
 use super::{
-    build::BuildArgs, coverage::CoverageArgs, doc::DocArgs, snapshot::GasSnapshotArgs,
-    test::TestArgs,
+    build::BuildArgs, coverage::CoverageArgs, doc::DocArgs, fmt::FmtArgs,
+    snapshot::GasSnapshotArgs, test::TestArgs,
 };
 use alloy_primitives::map::HashSet;
 use clap::Parser;
@@ -263,7 +263,7 @@ pub async fn watch_gas_snapshot(args: GasSnapshotArgs) -> Result<()> {
 /// test`
 pub async fn watch_test(args: TestArgs) -> Result<()> {
     let config: Config = args.build.load_config()?;
-    let filter = args.filter(&config);
+    let filter = args.filter(&config)?;
     // Marker to check whether to override the command.
     let no_reconfigure = filter.args().test_pattern.is_some() ||
         filter.args().path_pattern.is_some() ||
@@ -321,6 +321,14 @@ pub async fn watch_coverage(args: CoverageArgs) -> Result<()> {
     let config = args.watch().watchexec_config(|| {
         let config = args.load_config()?;
         Ok([config.test, config.src])
+    })?;
+    run(config).await
+}
+
+pub async fn watch_fmt(args: FmtArgs) -> Result<()> {
+    let config = args.watch.watchexec_config(|| {
+        let config = args.load_config()?;
+        Ok([config.src, config.test, config.script])
     })?;
     run(config).await
 }

@@ -1,11 +1,11 @@
-use crate::tx::{self, CastTxBuilder};
+use crate::tx::{self, CastTxBuilder, SenderKind};
 use alloy_network::{eip2718::Encodable2718, EthereumWallet, TransactionBuilder};
 use alloy_primitives::hex;
 use alloy_signer::Signer;
 use alloy_zksync::wallet::ZksyncWallet;
-use cast::ZkTransactionOpts;
+use cast::{NoopWallet, ZkTransactionOpts};
 use clap::Parser;
-use eyre::Result;
+use eyre::{OptionExt, Result};
 use foundry_cli::{
     opts::{EthereumOpts, TransactionOpts},
     utils::{get_provider, LoadConfig},
@@ -55,6 +55,12 @@ pub struct MakeTxArgs {
     /// Force a zksync eip-712 transaction and apply CREATE overrides
     #[arg(long = "zksync")]
     zk_force: bool,
+
+    /// Generate a raw RLP-encoded unsigned transaction.
+    ///
+    /// Relaxes the wallet requirement.
+    #[arg(long, requires = "from")]
+    raw_unsigned: bool,
 }
 
 #[derive(Debug, Parser)]
@@ -75,7 +81,8 @@ pub enum MakeTxSubcommands {
 
 impl MakeTxArgs {
     pub async fn run(self) -> Result<()> {
-        let Self { to, mut sig, mut args, command, tx, path, eth, zk_tx, zk_force } = self;
+        let Self { to, mut sig, mut args, command, tx, path, eth, zk_tx, zk_force, raw_unsigned } =
+            self;
 
         let blob_data = if let Some(path) = path { Some(std::fs::read(path)?) } else { None };
 
@@ -96,38 +103,72 @@ impl MakeTxArgs {
 
         let config = eth.load_config()?;
 
-        // Retrieve the signer, and bail if it can't be constructed.
-        let signer = eth.wallet.signer().await?;
-        let from = signer.address();
-
-        tx::validate_from_address(eth.wallet.from, from)?;
-
         let provider = get_provider(&config)?;
 
-        let (tx, _) = CastTxBuilder::new(provider, tx, &config)
+        // NOTE(zk): tx is built in two steps as signer might have a different type
+        let builder = CastTxBuilder::new(provider, tx, &config)
             .await?
             .with_to(to)
             .await?
             .with_code_sig_and_args(code, sig, args)
             .await?
-            .with_blob_data(blob_data)?
-            .build_raw(&signer)
-            .await?;
+            .with_blob_data(blob_data)?;
 
-        if zk_tx.has_zksync_args() || zk_force {
-            let zk_wallet = ZksyncWallet::new(signer);
-            let zktx = zksync::build_tx(zk_tx, tx, zkcode, &config).await?;
-            let signed = zktx.build(&zk_wallet).await?.encoded_2718();
-            sh_println!("0x{}", hex::encode(signed))?;
+        if raw_unsigned {
+            // Build unsigned raw tx
+            let from = eth.wallet.from.ok_or_eyre("missing `--from` address")?;
+            let raw_tx = builder.build_unsigned_raw(from).await?;
+
+            sh_println!("{raw_tx}")?;
             return Ok(());
         }
 
-        let tx = tx.build(&EthereumWallet::new(signer)).await?;
+        // Retrieve the signer, and bail if it can't be constructed.
+        // NOTE(zk): if custom signature is sent, signer is not used so
+        // we do not bail in that case, the Result is kept instead
+        let (from, maybe_signer) = if zk_tx.custom_signature.is_some() {
+            if let Some(from) = eth.wallet.from {
+                (from, None)
+            } else {
+                eyre::bail!("expected address via --from option to be used for custom signature");
+            }
+        } else {
+            let signer = eth.wallet.signer().await?;
+            let from = signer.address();
+            tx::validate_from_address(eth.wallet.from, from)?;
+            (from, Some(signer))
+        };
 
-        let signed_tx = hex::encode(tx.encoded_2718());
+        let (tx, _) = if zk_tx.custom_signature.is_some() {
+            builder.build_raw(SenderKind::Address(from)).await?
+        } else {
+            builder.build_raw(maybe_signer.as_ref().expect("No signer found")).await?
+        };
 
-        sh_println!("0x{signed_tx}")?;
+        if zk_tx.has_zksync_args() || zk_force {
+            let zktx = zksync::build_tx(zk_tx, tx, zkcode, &config).await?;
 
-        Ok(())
+            let signed_tx = if zktx.custom_signature().is_some() {
+                let zk_wallet = NoopWallet { address: from };
+                zktx.build(&zk_wallet).await?.encoded_2718()
+            } else {
+                let zk_wallet = ZksyncWallet::new(maybe_signer.expect("No signer found"));
+                zktx.build(&zk_wallet).await?.encoded_2718()
+            };
+
+            sh_println!("0x{}", hex::encode(signed_tx))?;
+
+            Ok(())
+        } else {
+            let signer = maybe_signer.expect("No signer found");
+
+            let tx = tx.build(&EthereumWallet::new(signer)).await?;
+
+            let signed_tx = hex::encode(tx.encoded_2718());
+
+            sh_println!("0x{signed_tx}")?;
+
+            Ok(())
+        }
     }
 }
